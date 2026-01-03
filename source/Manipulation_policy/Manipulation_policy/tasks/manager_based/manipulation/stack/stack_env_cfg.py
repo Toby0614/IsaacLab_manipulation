@@ -178,10 +178,10 @@ class StackEnvCfg(ManagerBasedRLEnvCfg):
     events = None
     curriculum = None
 
-    xr: XrCfg = XrCfg(
-        anchor_pos=(-0.1, -0.5, -1.05),
-        anchor_rot=(0.866, 0, 0, -0.5),
-    )
+    # NOTE: Disable OpenXR configuration for training runs.
+    # Hydra config serialization can fail on internal lambda callables inside XR configs (e.g. "lambda headpose"),
+    # which prevents the environment config from loading. If you need XR teleop, re-enable this.
+    xr: XrCfg | None = None
 
     def __post_init__(self):
         """Post initialization."""

@@ -9,6 +9,7 @@ import torch
 from typing import TYPE_CHECKING, Literal
 
 import isaaclab.utils.math as math_utils
+import torch.nn.functional as F
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCollection
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformer
@@ -165,6 +166,133 @@ def image(
         images = _apply_depth_postprocess(images, depth_range=depth_range, depth_normalize=depth_normalize)
 
     return images.clone()
+
+
+def image_feature_vector(
+    env,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    data_type: str = "rgb",
+    # preprocessing
+    out_hw: tuple[int, int] = (64, 64),
+    rgb_to_grayscale: bool = False,
+    # depth post-processing
+    depth_range: tuple[float, float] = (0.1, 2.0),
+    depth_normalize: Literal["none", "range"] = "range",
+) -> torch.Tensor:
+    """Turn an image tensor into a small feature vector for quick PPO bring-up.
+
+    Why this exists:
+    - RSL-RL's default actor-critic configs are MLP-based.
+    - A full CNN+fusion stack is doable, but it's a bigger integration step.
+    - This gives you a practical stepping stone: proprio + (downsampled, flattened) RGB-D.
+
+    Returns:
+    - (num_envs, D) float32 vector
+    """
+    img = image(
+        env,
+        sensor_cfg=sensor_cfg,
+        data_type=data_type,
+        normalize=False,
+        convert_perspective_to_orthogonal=False,
+        depth_range=depth_range,
+        depth_normalize=depth_normalize,
+    )
+
+    # Normalize dtypes/ranges
+    if data_type == "rgb":
+        # Expect (B,H,W,3) uint8, convert to float in [0,1]
+        x = img.float() / 255.0 if img.dtype == torch.uint8 else img.float()
+        # Make channel-first for interpolate: (B,3,H,W)
+        x = x.permute(0, 3, 1, 2)
+        if rgb_to_grayscale:
+            # simple luminance
+            r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+            x = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    else:
+        # Depth-like: make sure float, shape (B,1,H,W)
+        x = img.float()
+        if x.ndim == 3:
+            x = x.unsqueeze(-1)
+        x = x.permute(0, 3, 1, 2)
+
+    # Downsample
+    oh, ow = int(out_hw[0]), int(out_hw[1])
+    x = F.interpolate(x, size=(oh, ow), mode="bilinear", align_corners=False)
+
+    # Flatten to vector
+    x = x.reshape(x.shape[0], -1)
+    return x
+
+
+def rgbd_tensor_chw(
+    env,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    depth_data_type: str = "distance_to_image_plane",
+    depth_range: tuple[float, float] = (0.1, 2.0),
+    depth_normalize: Literal["none", "range"] = "range",
+) -> torch.Tensor:
+    """Return RGB-D as a channel-first float tensor: (B, 4, H, W).
+
+    This is the most common format expected by CNN vision encoders (including ActorCriticCNN-style modules).
+    - RGB is scaled to [0, 1]
+    - Depth is post-processed (inf->0, clamp, optional range-normalization)
+    """
+    rgb = image(env, sensor_cfg=sensor_cfg, data_type="rgb", normalize=False)
+    depth = image(
+        env,
+        sensor_cfg=sensor_cfg,
+        data_type=depth_data_type,
+        normalize=False,
+        depth_range=depth_range,
+        depth_normalize=depth_normalize,
+    )
+
+    # Ensure float32
+    if rgb.dtype == torch.uint8:
+        rgb_f = rgb.float() / 255.0
+    else:
+        rgb_f = rgb.float()
+
+    # HWC -> CHW
+    rgb_chw = rgb_f.permute(0, 3, 1, 2)  # (B,3,H,W)
+
+    # Depth comes out as (B,H,W,1) typically. Ensure channel dim exists then HWC->CHW.
+    if depth.ndim == 3:
+        depth = depth.unsqueeze(-1)
+    depth_chw = depth.float().permute(0, 3, 1, 2)  # (B,1,H,W)
+
+    return torch.cat([rgb_chw, depth_chw], dim=1).contiguous()
+
+
+def grasp_proprio_vector(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube_2"),
+) -> torch.Tensor:
+    """A compact proprio+task vector for grasp training.
+
+    Returns (B, D) vector. Designed to pair with `rgbd_tensor_chw` for ActorCriticCNN-style policies.
+    """
+    # Import IsaacLab MDP helpers lazily (avoid import-time issues in some tooling environments).
+    from isaaclab.envs.mdp import joint_pos_rel, joint_vel_rel, last_action
+
+    robot_joint_pos = joint_pos_rel(env, asset_cfg=robot_cfg)  # (B, nJ)
+    robot_joint_vel = joint_vel_rel(env, asset_cfg=robot_cfg)  # (B, nJ)
+    act = last_action(env)  # (B, nA)
+
+    ee_pos = ee_frame_pos(env, ee_frame_cfg=ee_frame_cfg)  # (B, 3)
+    ee_quat = ee_frame_quat(env, ee_frame_cfg=ee_frame_cfg)  # (B, 4)
+    grip = gripper_pos(env, robot_cfg=robot_cfg)  # (B, 1) or (B,2)
+
+    obj: RigidObject = env.scene[object_cfg.name]
+    obj_pos = obj.data.root_pos_w - env.scene.env_origins  # (B, 3)
+
+    # Relative position (helps a lot for grasping)
+    rel = obj_pos - ee_pos
+
+    return torch.cat([act, robot_joint_pos, robot_joint_vel, ee_pos, ee_quat, grip, rel], dim=1)
 
 
 def image_with_corruption(

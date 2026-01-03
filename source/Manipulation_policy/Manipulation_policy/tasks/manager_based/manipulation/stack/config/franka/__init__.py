@@ -60,6 +60,30 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Grasp-RSLRL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.stack_ik_rel_visuomotor_grasp_rslrl_env_cfg:FrankaCubeStackVisuomotorGraspRslRlEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Grasp-RSLRL-CNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.stack_ik_rel_visuomotor_grasp_rslrl_cnn_env_cfg:FrankaCubeStackVisuomotorGraspRslRlCnnEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cnn_cfg:PPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
     id="Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-StageB-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={

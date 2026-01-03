@@ -9,7 +9,9 @@ from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsA
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import CameraCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR
@@ -17,6 +19,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR
 # NOTE: Use local task implementation instead of the upstream `isaaclab_tasks` package.
 from ... import mdp
 from ...mdp import franka_stack_events
+from ...mdp import grasp_rewards
 
 from . import stack_joint_pos_env_cfg
 
@@ -197,8 +200,77 @@ class ObservationsCfg:
 
 
 @configclass
+class RewardsCfg:
+    """Minimal rewards for pure grasp of cube_2.
+
+    Tuning tips:
+    - If the robot never reaches: increase |reach| (e.g., -2.0) and/or scale action magnitude down.
+    - If it reaches but doesn't close: increase grasp_bonus.
+    - If it grasps but doesn't lift: increase lift weight or lower min_height a bit.
+    """
+
+    # dense reach shaping
+    reach = RewTerm(
+        func=grasp_rewards.reach_shaping,
+        weight=2.0,
+        params={
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+            "object_cfg": SceneEntityCfg("cube_2"),
+            "distance_scale": 1.0,
+        },
+    )
+
+    # sparse grasp bonus (uses existing grasp detector)
+    grasp_bonus = RewTerm(
+        func=mdp.object_grasped,
+        weight=5.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+            "object_cfg": SceneEntityCfg("cube_2"),
+            "diff_threshold": 0.06,
+        },
+    )
+
+    # lift shaping, gated by grasp signal so it doesn't encourage "bumping" the cube up
+    # NOTE: We keep gating logic here by multiplying inside a lambda-like wrapper is not supported,
+    # so we expose lift and let you optionally add gating later if needed.
+    lift = RewTerm(
+        func=grasp_rewards.lift_shaping,
+        weight=10.0,
+        params={
+            "object_cfg": SceneEntityCfg("cube_2"),
+            "min_height": 0.08,
+            "height_scale": 1.0,
+        },
+    )
+
+
+@configclass
+class TerminationsCfg:
+    """Terminations for pure grasp test."""
+
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    cube_2_dropping = DoneTerm(
+        func=mdp.root_height_below_minimum, params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("cube_2")}
+    )
+    # end episode once cube_2 is grasped (fast bring-up). You can disable this later for lift/place tasks.
+    success_grasp = DoneTerm(
+        func=mdp.object_grasped,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+            "object_cfg": SceneEntityCfg("cube_2"),
+            "diff_threshold": 0.06,
+        },
+    )
+
+
+@configclass
 class FrankaCubeStackVisuomotorEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
 
     # Evaluation settings
     eval_mode = False
