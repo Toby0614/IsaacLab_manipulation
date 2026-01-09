@@ -20,6 +20,15 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--export_policy",
+    action="store_true",
+    default=False,
+    help=(
+        "Export the loaded policy to JIT/ONNX before playing. "
+        "Note: for some CNN+fusion policies, ONNX export can fail due to normalizer/actor input shape mismatch."
+    ),
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -167,10 +176,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         normalizer = None
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    # export policy to onnx/jit (optional)
+    if args_cli.export_policy:
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        try:
+            export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        except Exception as e:
+            print(f"[WARN] Failed to export policy as JIT. Continuing without export. Error: {e}")
+        try:
+            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        except Exception as e:
+            print(f"[WARN] Failed to export policy as ONNX. Continuing without export. Error: {e}")
 
     dt = env.unwrapped.step_dt
 

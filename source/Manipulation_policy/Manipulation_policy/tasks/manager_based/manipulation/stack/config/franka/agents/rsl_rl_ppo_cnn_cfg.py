@@ -3,10 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RSL-RL PPO config using ActorCriticCNN (IsaacLab 2.3 + RSL-RL visual support).
+"""RSL-RL PPO CNN agent configuration for Franka pick-and-place.
 
-This file intentionally mirrors the standard PPO runner cfg, but switches the *policy module class*
-to `ActorCriticCNN` so RSL-RL uses its CNN vision encoder.
+Key features:
+- Low initial noise (0.3) for stable learning
+- Multi-camera setup: wrist RGB-D (4ch) + table RGB (3ch) = 7 channels
+- CNN processes 64x64 images, output concatenated with proprio at MLP
 """
 
 from isaaclab.utils import configclass
@@ -15,40 +17,38 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class RslRlPpoActorCriticCNNCfg(RslRlPpoActorCriticCfg):
-    """Extends the base actor-critic cfg with CNN encoder configs required by ActorCriticCNN."""
-
-    # Per-observation-group CNN configs (see rsl_rl.networks.CNN signature)
-    actor_cnn_cfg: dict = None  # type: ignore
-    critic_cnn_cfg: dict = None  # type: ignore
+    """Actor-critic with CNN encoder for multi-camera input."""
+    actor_cnn_cfg: dict = None
+    critic_cnn_cfg: dict = None
 
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """PPO Runner configuration."""
+    
     num_steps_per_env = 32
-    max_iterations = 4000
-    save_interval = 100
-    experiment_name = "franka_grasp_visuomotor_rslrl_cnn"
+    max_iterations = 8000
+    save_interval = 500
+    experiment_name = "franka_pickplace"
 
-    # Map environment observation groups to algorithm observation sets (required by rsl_rl>=3.2).
-    # Our env exposes top-level observation groups: "proprio" (B,D) and "rgbd" (B,4,H,W).
+    # Observation groups: proprio (vector) + multi_cam (7ch images)
     obs_groups = {
-        "policy": ["proprio", "rgbd"],
-        "critic": ["proprio", "rgbd"],
+        "policy": ["proprio", "multi_cam"],
+        "critic": ["proprio", "multi_cam"],
     }
 
-    # CNN + MLP fusion policy
+    # Actor-Critic CNN policy
     policy = RslRlPpoActorCriticCNNCfg(
         class_name="ActorCriticCNN",
-        init_noise_std=1.0,
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
-        actor_hidden_dims=[256, 256],
-        critic_hidden_dims=[256, 256],
+        init_noise_std=0.3,  # Low noise for stable learning
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         activation="elu",
-        # A simple starting CNN for 128x128 images
+        # CNN for 64x64 images with 7 input channels
         actor_cnn_cfg={
-            # if a single dict is provided, ActorCriticCNN applies it to each 2D obs group
-            "output_channels": [32, 64, 64],
+            "output_channels": [32, 64, 128],
             "kernel_size": [8, 4, 3],
             "stride": [4, 2, 1],
             "padding": "zeros",
@@ -59,7 +59,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
             "flatten": True,
         },
         critic_cnn_cfg={
-            "output_channels": [32, 64, 64],
+            "output_channels": [32, 64, 128],
             "kernel_size": [8, 4, 3],
             "stride": [4, 2, 1],
             "padding": "zeros",
@@ -75,15 +75,13 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.003,
-        num_learning_epochs=5,
+        entropy_coef=0.01,
+        num_learning_epochs=8,
         num_mini_batches=4,
         learning_rate=3.0e-4,
         schedule="adaptive",
         gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
+        lam=0.97,
+        desired_kl=0.008,
         max_grad_norm=1.0,
     )
-
-    # no __post_init__ needed

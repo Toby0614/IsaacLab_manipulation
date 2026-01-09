@@ -14,12 +14,13 @@ from isaaclab.app import AppLauncher
 
 # #region agent log
 def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict):
+    """Tiny debug logger (writes NDJSON). Kept minimal to avoid interfering with Isaac Sim."""
     import json, time, os
 
     try:
         payload = {
             "sessionId": "debug-session",
-            "runId": "run_obs_shapes",
+            "runId": "weakref_in_env_init",
             "hypothesisId": hypothesis_id,
             "location": location,
             "message": message,
@@ -27,21 +28,13 @@ def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict):
             "timestamp": int(time.time() * 1000),
         }
         line = json.dumps(payload) + "\n"
-
-        # Primary required log path (debug mode)
-        primary = "/home/toby0614/IsaacLab/Projects/Manipulation_policy/.cursor/debug.log"
-        os.makedirs(os.path.dirname(primary), exist_ok=True)
-        with open(primary, "a", encoding="utf-8") as f:
-            f.write(line)
-
-        # Secondary fallback path (helps when the primary path is not writable/visible)
         fallback = os.path.join(os.getcwd(), "outputs", "agent_debug.ndjson")
         os.makedirs(os.path.dirname(fallback), exist_ok=True)
         with open(fallback, "a", encoding="utf-8") as f:
             f.write(line)
-    except Exception as e:
-        # Avoid crashing training script; print minimal info so we can spot it in stdout.
-        print(f"[agent_dbg] failed to write debug log: {type(e).__name__}: {e}")
+    except Exception:
+        # Never crash the training script due to logging.
+        pass
 
 
 # #endregion agent log
@@ -74,11 +67,10 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# #region agent log
 _agent_dbg(
     "H1",
     "scripts/rsl_rl/train.py:args",
-    "Parsed CLI args relevant to camera initialization",
+    "CLI args snapshot",
     {
         "task": getattr(args_cli, "task", None),
         "headless": getattr(args_cli, "headless", None),
@@ -88,36 +80,23 @@ _agent_dbg(
         "num_envs": getattr(args_cli, "num_envs", None),
     },
 )
-# #endregion agent log
 
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# #region agent log
-# Auto-enable cameras for visuomotor / camera-based tasks.
-# Hypotheses:
-# - H1: task spawns CameraCfg but enable_cameras is False -> runtime error in camera init.
-# - H2: users expect camera-based tasks to "just work" without remembering --enable_cameras.
 _task = getattr(args_cli, "task", "") or ""
 _needs_cameras = any(k in _task for k in ["Visuomotor", "Camera", "RGB", "Depth"])
 _enable_cameras_before = getattr(args_cli, "enable_cameras", None)
 if _needs_cameras and not _enable_cameras_before:
     args_cli.enable_cameras = True
-    _agent_dbg(
-        "H1",
-        "scripts/rsl_rl/train.py:auto_enable_cameras",
-        "Auto-enabled cameras for camera-based task",
-        {"task": _task, "enable_cameras_before": _enable_cameras_before, "enable_cameras_after": True},
-    )
-else:
-    _agent_dbg(
-        "H1",
-        "scripts/rsl_rl/train.py:auto_enable_cameras",
-        "Did not auto-enable cameras (not needed or already enabled)",
-        {"task": _task, "enable_cameras_before": _enable_cameras_before, "enable_cameras_after": getattr(args_cli, "enable_cameras", None)},
-    )
-# #endregion agent log
+
+_agent_dbg(
+    "H1",
+    "scripts/rsl_rl/train.py:auto_enable_cameras",
+    "Camera enable decision",
+    {"task": _task, "needs_cameras": _needs_cameras, "before": _enable_cameras_before, "after": getattr(args_cli, "enable_cameras", None)},
+)
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -126,14 +105,12 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-# #region agent log
 _agent_dbg(
     "H2",
     "scripts/rsl_rl/train.py:app",
-    "AppLauncher created; camera enable flag after potential video override",
-    {"enable_cameras": getattr(args_cli, "enable_cameras", None), "video": getattr(args_cli, "video", None)},
+    "AppLauncher created",
+    {"local_rank": getattr(app_launcher, "local_rank", None), "global_rank": getattr(app_launcher, "global_rank", None)},
 )
-# #endregion agent log
 
 """Check for minimum supported RSL-RL version."""
 
@@ -249,7 +226,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    _agent_dbg(
+        "H3",
+        "scripts/rsl_rl/train.py:gym_make",
+        "Creating gym env",
+        {
+            "task": args_cli.task,
+            "render_mode": ("rgb_array" if args_cli.video else None),
+            "env_cfg_scene_num_envs": getattr(getattr(env_cfg, "scene", None), "num_envs", None),
+            "env_cfg_sim_device": getattr(getattr(env_cfg, "sim", None), "device", None),
+        },
+    )
+    try:
+        import time as _time
+        _t0 = _time.time()
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        _agent_dbg(
+            "H3",
+            "scripts/rsl_rl/train.py:gym_make",
+            "gym.make returned",
+            {"seconds": round(_time.time() - _t0, 3), "env_type": str(type(env))},
+        )
+    except Exception as e:
+        _agent_dbg(
+            "H3",
+            "scripts/rsl_rl/train.py:gym_make",
+            "gym.make failed",
+            {"error_type": type(e).__name__, "error": str(e)},
+        )
+        raise
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -275,48 +280,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
-    # #region agent log
-    # Log observation structure before constructing the runner (H4/H5: mismatched obs_groups vs env obs keys/shapes)
-    try:
-        obs_dbg = env.get_observations()
-        obs_summary = {"type": str(type(obs_dbg))}
-
-        def _summarize_value(v):
-            info = {"type": str(type(v))}
-            if hasattr(v, "shape"):
-                info["shape"] = tuple(v.shape)
-            if hasattr(v, "dtype"):
-                info["dtype"] = str(v.dtype)
-            # nested tensordict
-            if hasattr(v, "keys") and not hasattr(v, "shape"):
-                try:
-                    info["keys"] = list(v.keys())
-                except Exception:
-                    pass
-            return info
-
-        # Tensordict case (rsl_rl uses tensordict)
-        if hasattr(obs_dbg, "keys") and hasattr(obs_dbg, "get"):
-            try:
-                keys = list(obs_dbg.keys())
-                obs_summary["keys"] = [str(k) for k in keys]
-                obs_summary["items"] = {str(k): _summarize_value(obs_dbg.get(k)) for k in keys}
-            except Exception as e:
-                obs_summary["error"] = f"{type(e).__name__}: {e}"
-        # Dict fallback
-        elif isinstance(obs_dbg, dict):
-            obs_summary["keys"] = list(obs_dbg.keys())
-            obs_summary["items"] = {k: _summarize_value(v) for k, v in obs_dbg.items()}
-        _agent_dbg("H4", "scripts/rsl_rl/train.py:obs_before_runner", "Observation structure before runner init", obs_summary)
-    except Exception as e:
-        _agent_dbg(
-            "H4",
-            "scripts/rsl_rl/train.py:obs_before_runner",
-            "Failed to read observations before runner init",
-            {"error": f"{type(e).__name__}: {e}"},
-        )
-    # #endregion agent log
+    _agent_dbg("H4", "scripts/rsl_rl/train.py:wrap", "Wrapped env for rsl-rl", {"type": str(type(env))})
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
@@ -338,7 +302,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    try:
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    except KeyboardInterrupt:
+        # Best-effort: save a final checkpoint on Ctrl+C so you don't have to wait for the next save_interval.
+        try:
+            interrupt_ckpt = os.path.join(log_dir, f"model_interrupt_{int(time.time())}.pt")
+            if hasattr(runner, "save"):
+                try:
+                    runner.save(interrupt_ckpt)
+                except TypeError:
+                    # Some rsl_rl versions use different save() signatures; try common alternative.
+                    runner.save(path=interrupt_ckpt)  # type: ignore[arg-type]
+            else:
+                print("[WARN] Runner has no save() method; keeping last periodic checkpoint only.")
+            print(f"[INFO] Interrupt: saved checkpoint to: {interrupt_ckpt}")
+        except Exception as e:
+            print(f"[WARN] Interrupt: failed to save checkpoint on Ctrl+C: {type(e).__name__}: {e}")
+        raise
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 

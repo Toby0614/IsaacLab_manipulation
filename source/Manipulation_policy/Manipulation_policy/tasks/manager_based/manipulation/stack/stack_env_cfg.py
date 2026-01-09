@@ -189,8 +189,12 @@ class StackEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 5
         self.episode_length_s = 30.0
         # simulation settings
-        self.sim.dt = 0.01  # 100Hz
-        self.sim.render_interval = 2
+        # Physics at ~60Hz (was 100Hz).
+        self.sim.dt = 0.0166667
+        # IMPORTANT: keep render_interval >= decimation when using cameras.
+        # If render_interval < decimation, IsaacLab warns and may render multiple times per env step.
+        # Rendering dominates performance with many envs + cameras, so avoid extra renders.
+        self.sim.render_interval = self.decimation
 
         self.sim.physx.bounce_threshold_velocity = 0.2
         self.sim.physx.bounce_threshold_velocity = 0.01

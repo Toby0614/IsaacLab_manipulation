@@ -265,6 +265,68 @@ def rgbd_tensor_chw(
     return torch.cat([rgb_chw, depth_chw], dim=1).contiguous()
 
 
+def rgb_tensor_chw(
+    env,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("table_cam"),
+) -> torch.Tensor:
+    """Return RGB as a channel-first float tensor: (B, 3, H, W).
+
+    Lighter weight than RGB-D for cameras where depth isn't critical (e.g., table overview camera).
+    - RGB is scaled to [0, 1]
+    """
+    rgb = image(env, sensor_cfg=sensor_cfg, data_type="rgb", normalize=False)
+
+    # Ensure float32 and scale to [0, 1]
+    if rgb.dtype == torch.uint8:
+        rgb_f = rgb.float() / 255.0
+    else:
+        rgb_f = rgb.float()
+
+    # HWC -> CHW
+    rgb_chw = rgb_f.permute(0, 3, 1, 2)  # (B,3,H,W)
+
+    return rgb_chw.contiguous()
+
+
+def multi_cam_tensor_chw(
+    env,
+    wrist_cam_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    table_cam_cfg: SceneEntityCfg = SceneEntityCfg("table_cam"),
+    depth_data_type: str = "distance_to_image_plane",
+    depth_range: tuple[float, float] = (0.1, 2.0),
+    depth_normalize: Literal["none", "range"] = "range",
+) -> torch.Tensor:
+    """Return combined multi-camera tensor: wrist RGB-D (4ch) + table RGB (3ch) = (B, 7, H, W).
+
+    This provides:
+    - Wrist camera: RGB-D (4 channels) for close-up manipulation view
+    - Table camera: RGB only (3 channels) for overview/placement guidance
+    
+    All images are resized to match the wrist camera resolution if different.
+    """
+    # Wrist camera RGB-D
+    wrist_rgbd = rgbd_tensor_chw(
+        env,
+        sensor_cfg=wrist_cam_cfg,
+        depth_data_type=depth_data_type,
+        depth_range=depth_range,
+        depth_normalize=depth_normalize,
+    )  # (B, 4, H, W)
+    
+    # Table camera RGB only
+    table_rgb = rgb_tensor_chw(env, sensor_cfg=table_cam_cfg)  # (B, 3, H, W)
+    
+    # Resize table_rgb to match wrist_rgbd if different sizes
+    wrist_h, wrist_w = wrist_rgbd.shape[2], wrist_rgbd.shape[3]
+    table_h, table_w = table_rgb.shape[2], table_rgb.shape[3]
+    
+    if table_h != wrist_h or table_w != wrist_w:
+        table_rgb = F.interpolate(table_rgb, size=(wrist_h, wrist_w), mode="bilinear", align_corners=False)
+    
+    # Concatenate: wrist RGB-D (4ch) + table RGB (3ch) = 7 channels
+    return torch.cat([wrist_rgbd, table_rgb], dim=1).contiguous()
+
+
 def grasp_proprio_vector(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -293,6 +355,77 @@ def grasp_proprio_vector(
     rel = obj_pos - ee_pos
 
     return torch.cat([act, robot_joint_pos, robot_joint_vel, ee_pos, ee_quat, grip, rel], dim=1)
+
+
+def pickplace_proprio_vector(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube_2"),
+    goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+    table_z: float = 0.0203,
+) -> torch.Tensor:
+    """Proprio vector for PICK-AND-PLACE with GOAL information.
+
+    THIS IS CRITICAL: Without goal info, the robot cannot learn where to place!
+    
+    Returns (B, D) vector containing:
+    - Robot state (joints, gripper)
+    - EE pose
+    - Object position and relative pos to EE
+    - GOAL position (the target location!)
+    - Object-to-goal vector (tells robot how far cube is from goal)
+    - Object height above table (for lift detection)
+    
+    Designed to pair with `rgbd_tensor_chw` for ActorCriticCNN-style policies.
+    """
+    from isaaclab.envs.mdp import joint_pos_rel, joint_vel_rel, last_action
+
+    # Robot state
+    robot_joint_pos = joint_pos_rel(env, asset_cfg=robot_cfg)  # (B, nJ)
+    robot_joint_vel = joint_vel_rel(env, asset_cfg=robot_cfg)  # (B, nJ)
+    act = last_action(env)  # (B, nA)
+
+    # End-effector state
+    ee_pos = ee_frame_pos(env, ee_frame_cfg=ee_frame_cfg)  # (B, 3)
+    ee_quat = ee_frame_quat(env, ee_frame_cfg=ee_frame_cfg)  # (B, 4)
+    grip = gripper_pos(env, robot_cfg=robot_cfg)  # (B, 1) or (B,2)
+
+    # Object state
+    obj: RigidObject = env.scene[object_cfg.name]
+    obj_pos = obj.data.root_pos_w - env.scene.env_origins  # (B, 3)
+    
+    # EE to object (for reaching)
+    ee_to_obj = obj_pos - ee_pos  # (B, 3)
+    
+    # CRITICAL: Goal information
+    goal = torch.tensor(goal_pos, device=env.device, dtype=torch.float32)
+    goal = goal.unsqueeze(0).expand(env.num_envs, -1)  # (B, 3)
+    
+    # Object to goal (for placing) - THIS IS THE KEY MISSING PIECE!
+    obj_to_goal = goal - obj_pos  # (B, 3)
+    obj_to_goal_xy_dist = torch.linalg.vector_norm(obj_to_goal[:, :2], dim=1, keepdim=True)  # (B, 1)
+    
+    # EE to goal (for navigation)
+    ee_to_goal = goal - ee_pos  # (B, 3)
+    
+    # Object height above table (for lift awareness)
+    obj_height = (obj_pos[:, 2:3] - table_z)  # (B, 1)
+
+    return torch.cat([
+        act,                    # (B, nA) - last action
+        robot_joint_pos,        # (B, nJ) - joint positions
+        robot_joint_vel,        # (B, nJ) - joint velocities  
+        ee_pos,                 # (B, 3) - end-effector position
+        ee_quat,                # (B, 4) - end-effector orientation
+        grip,                   # (B, 1-2) - gripper state
+        ee_to_obj,              # (B, 3) - vector from EE to object (for reaching)
+        goal,                   # (B, 3) - GOAL POSITION (critical!)
+        obj_to_goal,            # (B, 3) - vector from object to goal (for placing)
+        obj_to_goal_xy_dist,    # (B, 1) - XY distance to goal
+        ee_to_goal,             # (B, 3) - vector from EE to goal
+        obj_height,             # (B, 1) - object height above table
+    ], dim=1)
 
 
 def image_with_corruption(
@@ -615,7 +748,8 @@ def gripper_pos(
             gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
             assert len(gripper_joint_ids) == 2, "Observation gripper_pos only support parallel gripper for now"
             finger_joint_1 = robot.data.joint_pos[:, gripper_joint_ids[0]].clone().unsqueeze(1)
-            finger_joint_2 = -1 * robot.data.joint_pos[:, gripper_joint_ids[1]].clone().unsqueeze(1)
+            # Franka finger joints can be mirrored (second joint often negative). Use abs() for a stable magnitude signal.
+            finger_joint_2 = torch.abs(robot.data.joint_pos[:, gripper_joint_ids[1]]).clone().unsqueeze(1)
             return torch.cat((finger_joint_1, finger_joint_2), dim=1)
         else:
             raise NotImplementedError("[Error] Cannot find gripper_joint_names in the environment config")
@@ -640,8 +774,9 @@ def object_grasped(
 
     if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:
         surface_gripper = env.scene.surface_grippers["surface_gripper"]
-        suction_cup_status = surface_gripper.state.view(-1, 1)  # 1: closed, 0: closing, -1: open
-        suction_cup_is_closed = (suction_cup_status == 1).to(torch.float32)
+        # Keep everything shape (B,) to avoid accidental broadcasting to (B,B).
+        suction_cup_status = surface_gripper.state.view(-1)  # 1: closed, 0: closing, -1: open
+        suction_cup_is_closed = (suction_cup_status == 1)
         grasped = torch.logical_and(suction_cup_is_closed, pose_diff < diff_threshold)
 
     else:
@@ -692,8 +827,9 @@ def object_stacked(
 
     if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:
         surface_gripper = env.scene.surface_grippers["surface_gripper"]
-        suction_cup_status = surface_gripper.state.view(-1, 1)  # 1: closed, 0: closing, -1: open
-        suction_cup_is_open = (suction_cup_status == -1).to(torch.float32)
+        # Keep everything shape (B,) to avoid accidental broadcasting to (B,B).
+        suction_cup_status = surface_gripper.state.view(-1)  # 1: closed, 0: closing, -1: open
+        suction_cup_is_open = (suction_cup_status == -1)
         stacked = torch.logical_and(suction_cup_is_open, stacked)
 
     else:
@@ -722,6 +858,23 @@ def object_stacked(
             raise ValueError("No gripper_joint_names found in environment config")
 
     return stacked
+
+
+def target_cube_lin_ang_vel(
+    env: "ManagerBasedRLEnv",
+    object_name: str = "cube_2",
+) -> torch.Tensor:
+    """Target cube linear+angular velocity in world frame (velocities are translation-invariant).
+
+    Returns:
+        Tensor of shape (num_envs, 6): [lin_vel(3), ang_vel(3)]
+
+    Why it matters:
+    - Helps the policy learn stable placement / reduce wobble after release.
+    - Improves credit assignment for stability-based rewards/terminations.
+    """
+    obj: RigidObject = env.scene[object_name]
+    return torch.cat([obj.data.root_lin_vel_w, obj.data.root_ang_vel_w], dim=1)
 
 
 def contact_force_magnitudes(
@@ -914,3 +1067,121 @@ def ee_frame_pose_in_base_frame(
         return ee_quat_in_base
     elif return_key is None:
         return torch.cat((ee_pos_in_base, ee_quat_in_base), dim=1)
+
+
+# =============================================================================
+# Goal-related observations for pick-and-place tasks
+# =============================================================================
+
+
+def goal_position(
+    env: "ManagerBasedRLEnv",
+    goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+) -> torch.Tensor:
+    """Return the goal position as an observation (env frame).
+
+    This is CRITICAL for pick-and-place: the policy needs to know WHERE to place the object.
+    """
+    goal = torch.tensor(goal_pos, device=env.device, dtype=torch.float32)
+    return goal.unsqueeze(0).expand(env.num_envs, -1)
+
+
+def ee_to_goal_vector(
+    env: "ManagerBasedRLEnv",
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+) -> torch.Tensor:
+    """Vector from end-effector to goal location (env frame).
+
+    Provides directional information for the policy to navigate toward the goal.
+    """
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    ee_pos = ee_frame.data.target_pos_w[:, 0, :] - env.scene.env_origins
+    goal = ee_pos.new_tensor(goal_pos).unsqueeze(0)
+    return goal - ee_pos
+
+
+def cube_to_goal_vector(
+    env: "ManagerBasedRLEnv",
+    object_name: str = "cube_2",
+    goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+) -> torch.Tensor:
+    """Vector from target cube to goal location (env frame).
+
+    Directly tells the policy how far and in which direction the cube needs to move.
+    """
+    obj: RigidObject = env.scene[object_name]
+    pos = obj.data.root_pos_w - env.scene.env_origins
+    goal = pos.new_tensor(goal_pos).unsqueeze(0)
+    return goal - pos
+
+
+def cube_to_goal_distance_xy(
+    env: "ManagerBasedRLEnv",
+    object_name: str = "cube_2",
+    goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+) -> torch.Tensor:
+    """XY distance from target cube to goal (scalar observation).
+
+    Provides a simple scalar metric of progress toward the goal.
+    """
+    obj: RigidObject = env.scene[object_name]
+    pos = obj.data.root_pos_w - env.scene.env_origins
+    goal = pos.new_tensor(goal_pos).unsqueeze(0)
+    dist = torch.linalg.vector_norm(pos[:, :2] - goal[:, :2], dim=1, keepdim=True)
+    return dist
+
+
+def cube_in_goal_region(
+    env: "ManagerBasedRLEnv",
+    object_name: str = "cube_2",
+    goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+    goal_half_extents_xy: tuple[float, float] = (0.025, 0.025),
+) -> torch.Tensor:
+    """Binary indicator: is the cube inside the goal XY region? (0 or 1)
+
+    Helps the policy recognize when it has reached the placement area.
+    """
+    obj: RigidObject = env.scene[object_name]
+    pos = obj.data.root_pos_w - env.scene.env_origins
+    gx, gy = float(goal_pos[0]), float(goal_pos[1])
+    hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
+    in_x = torch.abs(pos[:, 0] - gx) <= hx
+    in_y = torch.abs(pos[:, 1] - gy) <= hy
+    in_goal = torch.logical_and(in_x, in_y).to(dtype=torch.float32, device=env.device)
+    return in_goal.unsqueeze(-1)
+
+
+def target_cube_height_above_table(
+    env: "ManagerBasedRLEnv",
+    object_name: str = "cube_2",
+    table_z: float = 0.0203,
+) -> torch.Tensor:
+    """Height of target cube above the table surface.
+
+    Helps policy understand the lift/lower progress.
+    """
+    obj: RigidObject = env.scene[object_name]
+    z = obj.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    h = z - float(table_z)
+    return h.unsqueeze(-1)
+
+
+def gripper_open_fraction(
+    env: "ManagerBasedRLEnv",
+    robot_name: str = "robot",
+) -> torch.Tensor:
+    """Gripper opening fraction in [0, 1].
+
+    Useful for the policy to know its own gripper state explicitly.
+    """
+    robot: Articulation = env.scene[robot_name]
+    if not hasattr(env.cfg, "gripper_joint_names") or not hasattr(env.cfg, "gripper_open_val"):
+        return torch.zeros((env.num_envs, 1), device=env.device, dtype=torch.float32)
+    joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
+    if len(joint_ids) < 1:
+        return torch.zeros((env.num_envs, 1), device=env.device, dtype=torch.float32)
+    q = robot.data.joint_pos[:, joint_ids]
+    open_val = max(float(env.cfg.gripper_open_val), 1e-6)
+    opening = torch.mean(torch.abs(q), dim=1, keepdim=True)
+    return torch.clamp(opening / open_val, 0.0, 1.0)
