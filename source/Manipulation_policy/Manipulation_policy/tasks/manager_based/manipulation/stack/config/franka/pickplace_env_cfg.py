@@ -40,10 +40,16 @@ from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 # =============================================================================
 # TASK CONFIGURATION
 # =============================================================================
-GOAL_POS = (0.70, 0.20, 0.0203)  # Goal position (x, y, z) on table
+# NOTE: Table is centered at (0.5, 0.0) (see `stack_env_cfg.py`), and cubes reset around:
+#   x ∈ [0.40, 0.60], y ∈ [-0.10, 0.10]
+# Fixed goal (kept simple; no goal randomization).
+# Updated goal position: moved -0.45 in X, +0.5 in Y from previous (0.66, -0.22)
+# New position: (0.21, 0.28) - on the left side of the table, forward from robot
+GOAL_POS = (0.21, 0.28, 0.0203)
 GOAL_HALF_EXTENTS_XY = (0.05, 0.05)  # 10cm x 10cm goal region
 TABLE_Z = 0.0203  # Table surface height
-LIFT_HEIGHT = 0.06  # 6cm above table to count as "lifted"
+# Slightly higher lift target to encourage a cleaner "lift up" before transport.
+LIFT_HEIGHT = 0.07  # 7cm above table to count as "lifted"
 # Grasp heuristic parameters (used by mdp.object_grasped)
 # NOTE: mdp.object_grasped is a proximity heuristic, not a true contact grasp detector.
 # If this threshold is too large, the policy can "farm" grasp reward by hovering near the cube with a closed gripper.
@@ -376,9 +382,70 @@ class RewardsCfg:
     # =========================================================================
     # Action rate penalty (smooth actions)
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-5e-5)
+
+    # Temporal consistency / action smoothness (2nd-order). This targets "wobbling" better than action_rate alone.
+    action_temporal_consistency = RewTerm(func=grasp_rewards.ActionSecondDifferenceL2Term, weight=-1e-4)
     
     # Joint velocity penalty (prevents jerky motions that cause drops)
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-5)
+
+    # -------------------------------------------------------------------------
+    # EXTRA ANTI-WOBBLE TERMS (ADDED ON TOP of the working reward system)
+    # -------------------------------------------------------------------------
+    # These are intentionally small and mostly act as "regularizers":
+    # - discourage high-frequency joint oscillations (joint acceleration / torque)
+    # - discourage shaking the object while carrying
+    # - discourage slamming down near the goal during placement
+
+    # Penalize joint accelerations (targets the vibration you observed).
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2e-6)
+
+    # Penalize applied torques (reduces aggressive IK corrections / oscillations).
+    joint_torques = RewTerm(func=mdp.joint_torques_l2, weight=-2e-7)
+
+    # Penalize object motion once grasped + minimally lifted (reduces "wobble while carrying").
+    # Weight reduced from -0.25 to -0.12 to avoid over-penalizing normal transport velocity
+    object_motion = RewTerm(
+        func=grasp_rewards.object_motion_l2_when_grasped,
+        weight=-0.12,
+        params={
+            "robot_name": "robot",
+            "ee_frame_name": "ee_frame",
+            "object_name": "cube_2",
+            "diff_threshold": GRASP_DIFF_THRESH_REW,
+            "table_z": TABLE_Z,
+            "lift_on": 0.02,
+            "ang_vel_scale": 0.15,
+        },
+    )
+
+    # Penalize sideways motion during the lift band (encourages "lift straight up").
+    lift_straight_up = RewTerm(
+        func=grasp_rewards.object_xy_speed_during_lift_penalty,
+        weight=-0.15,
+        params={
+            "robot_name": "robot",
+            "ee_frame_name": "ee_frame",
+            "object_name": "cube_2",
+            "diff_threshold": GRASP_DIFF_THRESH_REW,
+            "table_z": TABLE_Z,
+            "lift_on": 0.01,
+            "lift_target": LIFT_HEIGHT,
+        },
+    )
+
+    # Penalize high downward velocity near the goal (encourages gentle placement).
+    # Weight reduced from -2.0 to -1.0 to allow reasonable placement speed while still discouraging slamming
+    slam_near_goal = RewTerm(
+        func=grasp_rewards.slam_penalty_near_goal,
+        weight=-1.0,
+        params={
+            "object_name": "cube_2",
+            "goal_pos": GOAL_POS,
+            "sigma_goal": 0.18,
+            "vz_thresh": 0.18,
+        },
+    )
 
 
 # =============================================================================
@@ -450,7 +517,8 @@ class FrankaPickPlaceEnvCfg(StackEnvCfg):
         super().__post_init__()
 
         # Episode settings
-        self.episode_length_s = 10.0
+        # Requested: increase from ~5s -> 7s to give the policy more time to complete smoother place.
+        self.episode_length_s = 7.0
 
         # Events
         self.events = EventCfg()
@@ -530,6 +598,35 @@ class FrankaPickPlaceEnvCfg(StackEnvCfg):
         self.scene.plane.semantic_tags = [("class", "ground")]
 
         # =====================================================================
+        # GOAL REGION VISUALIZATION (colored box you can see)
+        # =====================================================================
+        # This is a kinematic, collision-disabled cuboid placed at the fixed goal.
+        # Bright red/orange color for high visibility
+        goal_size = (2.0 * GOAL_HALF_EXTENTS_XY[0], 2.0 * GOAL_HALF_EXTENTS_XY[1], 0.002)
+        self.scene.goal_region = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/GoalRegion",
+            init_state=RigidObjectCfg.InitialStateCfg(pos=[GOAL_POS[0], GOAL_POS[1], GOAL_POS[2]], rot=[1, 0, 0, 0]),
+            spawn=sim_utils.CuboidCfg(
+                size=goal_size,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.15, 0.05),  # Bright red-orange
+                    emissive_color=(0.6, 0.1, 0.0),    # Red glow
+                    roughness=0.3,
+                    metallic=0.0,
+                    opacity=0.45,  # Slightly more opaque for better visibility
+                ),
+                rigid_props=RigidBodyPropertiesCfg(
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                    solver_position_iteration_count=1,
+                    solver_velocity_iteration_count=0,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            ),
+        )
+        self.scene.goal_region.spawn.semantic_tags = [("class", "goal_region")]
+
+        # =====================================================================
         # END EFFECTOR FRAME
         # =====================================================================
         marker_cfg = FRAME_MARKER_CFG.copy()
@@ -587,7 +684,7 @@ class FrankaPickPlaceEnvCfg(StackEnvCfg):
                 focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 2.0)
             ),
             offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.065, 0.0, 0.04), rot=(0.0, 0.70711, 0.0, 0.70711), convention="ros"
+                pos=(0.13, 0.0, -0.15), rot=(-0.70614, 0.03701, 0.03701, -0.70614), convention="ros"
             ),
         )
 

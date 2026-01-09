@@ -422,7 +422,6 @@ def hover_penalty_in_goal_xy_when_grasped(
 
     obj: RigidObject = env.scene[object_name]
     pos = obj.data.root_pos_w - env.scene.env_origins
-
     gx, gy = float(goal_pos[0]), float(goal_pos[1])
     hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
     in_xy = torch.logical_and(torch.abs(pos[:, 0] - gx) <= hx, torch.abs(pos[:, 1] - gy) <= hy).to(dtype=torch.float32)
@@ -773,6 +772,123 @@ def slam_penalty_near_goal(
     slam = torch.relu(-vz - float(vz_thresh))
     return g_near * slam
 
+
+class ActionSecondDifferenceL2Term(ManagerTermBase):
+    """Temporal consistency penalty (second-order action smoothness).
+
+    Penalizes: ||a_t - 2 a_{t-1} + a_{t-2}||^2
+
+    This targets high-frequency oscillations better than a simple first-difference action-rate penalty.
+    Use with a NEGATIVE weight in reward config.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        act_dim = int(sum(env.action_manager.action_term_dim))
+        self._prev = torch.zeros((env.num_envs, act_dim), device=env.device, dtype=torch.float32)
+        self._prev2 = torch.zeros((env.num_envs, act_dim), device=env.device, dtype=torch.float32)
+        self._initialized = torch.zeros((env.num_envs,), device=env.device, dtype=torch.bool)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        # On reset, we don't know meaningful previous actions. Initialize from current action if available.
+        a = self._env.action_manager.action
+        if a is None:
+            self._prev[env_ids] = 0.0
+            self._prev2[env_ids] = 0.0
+        else:
+            self._prev[env_ids] = a[env_ids].detach()
+            self._prev2[env_ids] = a[env_ids].detach()
+        self._initialized[env_ids] = True
+
+    def __call__(self, env: "ManagerBasedRLEnv") -> torch.Tensor:
+        a = env.action_manager.action
+        # If we haven't initialized yet (first call before reset), just return zeros and initialize.
+        if not torch.all(self._initialized):
+            missing = torch.logical_not(self._initialized)
+            self._prev[missing] = a[missing].detach()
+            self._prev2[missing] = a[missing].detach()
+            self._initialized[missing] = True
+            return torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+
+        d2 = a - 2.0 * self._prev + self._prev2
+        # shift history
+        self._prev2 = self._prev
+        self._prev = a.detach()
+        return torch.sum(torch.square(d2), dim=1)
+
+
+def object_motion_l2_when_grasped(
+    env: "ManagerBasedRLEnv",
+    robot_name: str = "robot",
+    ee_frame_name: str = "ee_frame",
+    object_name: str = "cube_2",
+    diff_threshold: float = 0.06,
+    table_z: float = 0.0203,
+    lift_on: float = 0.02,
+    ang_vel_scale: float = 0.2,
+) -> torch.Tensor:
+    """Penalty (positive scalar) for moving the object too fast while carrying.
+
+    This is meant to reduce "wobbling"/vibration in the arm that shows up as object shake.
+
+    - gated by a grasp heuristic AND a minimal lift height (to avoid penalizing pre-grasp motion)
+    - penalizes linear speed squared + scaled angular speed squared
+
+    Use with a NEGATIVE weight in reward config.
+    """
+    g = grasp_hold(
+        env,
+        robot_name=robot_name,
+        ee_frame_name=ee_frame_name,
+        object_name=object_name,
+        diff_threshold=diff_threshold,
+    )
+    h = _cube_height_above_table(env, object_name=object_name, table_z=table_z)
+    gate = g * (h > float(lift_on)).to(torch.float32)
+
+    obj: RigidObject = env.scene[object_name]
+    v = torch.linalg.vector_norm(obj.data.root_lin_vel_w, dim=1)
+    w = torch.linalg.vector_norm(obj.data.root_ang_vel_w, dim=1)
+    return gate * (v * v + float(ang_vel_scale) * (w * w))
+
+
+def object_xy_speed_during_lift_penalty(
+    env: "ManagerBasedRLEnv",
+    robot_name: str = "robot",
+    ee_frame_name: str = "ee_frame",
+    object_name: str = "cube_2",
+    diff_threshold: float = 0.06,
+    table_z: float = 0.0203,
+    lift_on: float = 0.01,
+    lift_target: float = 0.06,
+) -> torch.Tensor:
+    """Penalty (positive scalar) for horizontal motion while lifting.
+
+    Encourages the behavior you described: "lift straight up" after grasp,
+    instead of immediately swinging/dragging sideways.
+
+    Active only when:
+    - grasped (heuristic)
+    - height is between lift_on and lift_target (i.e., during the lift phase)
+
+    Use with a NEGATIVE weight in reward config.
+    """
+    g = grasp_hold(
+        env,
+        robot_name=robot_name,
+        ee_frame_name=ee_frame_name,
+        object_name=object_name,
+        diff_threshold=diff_threshold,
+    )
+    h = _cube_height_above_table(env, object_name=object_name, table_z=table_z)
+    in_lift_band = torch.logical_and(h > float(lift_on), h < float(lift_target))
+    gate = g * in_lift_band.to(torch.float32)
+
+    obj: RigidObject = env.scene[object_name]
+    vxy2 = torch.sum(torch.square(obj.data.root_lin_vel_w[:, :2]), dim=1)
+    return gate * vxy2
 
 class OtherCubesDisplacementPenaltyTerm(ManagerTermBase):
     """Penalty for moving other cubes away from their reset positions (better than proximity penalties)."""

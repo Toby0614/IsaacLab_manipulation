@@ -193,7 +193,6 @@ def randomize_object_pose(
                 torch.zeros(1, 6, device=env.device), env_ids=torch.tensor([cur_env], device=env.device)
             )
 
-
 def randomize_rigid_objects_in_focus(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
