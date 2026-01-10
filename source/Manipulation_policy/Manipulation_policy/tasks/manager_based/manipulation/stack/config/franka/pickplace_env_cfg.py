@@ -154,7 +154,7 @@ class ObservationsCfg:
         """Combined camera observations: wrist RGB-D (4ch) + table RGB (3ch) = 7 channels."""
 
         multi_cam = ObsTerm(
-            func=mdp.multi_cam_tensor_chw,
+            func=mdp.multi_cam_tensor_chw_with_dropout,  # ← CHANGED: dropout-aware version
             params={
                 "wrist_cam_cfg": SceneEntityCfg("wrist_cam"),
                 "table_cam_cfg": SceneEntityCfg("table_cam"),

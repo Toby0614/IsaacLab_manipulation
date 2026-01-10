@@ -61,6 +61,24 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+# modality dropout arguments
+parser.add_argument(
+    "--dropout_mode", type=str, default="none", choices=["none", "hard", "soft", "mixed"],
+    help="Modality dropout mode: none (disabled), hard (blackout), soft (noise), mixed (both)"
+)
+parser.add_argument("--dropout_prob", type=float, default=None, help="Dropout probability per step")
+parser.add_argument("--dropout_duration_min", type=int, default=None, help="Min dropout duration (steps)")
+parser.add_argument("--dropout_duration_max", type=int, default=None, help="Max dropout duration (steps)")
+# force sensing arguments
+parser.add_argument(
+    "--force_sensing", action="store_true", default=False,
+    help="Enable gripper force sensing (tensile sensor) via wrapper. Adds force to proprio obs."
+)
+parser.add_argument(
+    "--force_mode", type=str, default="with_closure",
+    choices=["scalar", "per_finger", "with_closure", "contact_estimate", "grasp_indicator"],
+    help="Force sensing mode: scalar (1d), per_finger (2d), with_closure (3d), contact_estimate (2d), grasp_indicator (3d)"
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -99,6 +117,26 @@ _agent_dbg(
 )
 
 # clear out sys.argv for Hydra
+# NOTE: Hydra uses its own override grammar (Hydra 1.2 in IsaacLab 2.3). If the user accidentally
+# passes a standalone "\" token (common when editing bash line continuations like `cmd \ \`),
+# Hydra will throw LexerNoViableAltException before we ever reach environment creation.
+# We defensively strip such stray tokens here.
+def _sanitize_hydra_overrides(overrides: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    for a in overrides:
+        if a is None:
+            continue
+        s = str(a)
+        if s.strip() == "":
+            continue
+        # drop standalone backslash tokens (or sequences of backslashes with no other chars)
+        if s.strip("\\").strip() == "":
+            continue
+        sanitized.append(s)
+    return sanitized
+
+
+hydra_args = _sanitize_hydra_overrides(hydra_args)
 sys.argv = [sys.argv[0]] + hydra_args
 
 # launch omniverse app
@@ -275,6 +313,85 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    # wrap for modality dropout (M3 training)
+    if args_cli.dropout_mode != "none":
+        try:
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.dropout_env_wrapper import VecEnvDropoutWrapper
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.modality_dropout_cfg import (
+                HardDropoutTrainingCfg,
+                SoftDropoutTrainingCfg,
+                MixedDropoutTrainingCfg,
+            )
+            
+            # Create config based on mode
+            if args_cli.dropout_mode == "hard":
+                dropout_cfg = HardDropoutTrainingCfg()
+            elif args_cli.dropout_mode == "soft":
+                dropout_cfg = SoftDropoutTrainingCfg()
+            elif args_cli.dropout_mode == "mixed":
+                dropout_cfg = MixedDropoutTrainingCfg()
+            
+            # Apply CLI overrides
+            if args_cli.dropout_prob is not None:
+                dropout_cfg.dropout_probability = args_cli.dropout_prob
+            if args_cli.dropout_duration_min is not None and args_cli.dropout_duration_max is not None:
+                dropout_cfg.dropout_duration_range = (args_cli.dropout_duration_min, args_cli.dropout_duration_max)
+            
+            # Wrap environment
+            env = VecEnvDropoutWrapper(env, dropout_cfg)
+            
+            print("="*80)
+            print(f"[INFO] Modality Dropout ENABLED (M3 Training):")
+            print(f"  Mode: {dropout_cfg.dropout_mode}")
+            print(f"  Probability: {dropout_cfg.dropout_probability:.3f}")
+            print(f"  Duration range: {dropout_cfg.dropout_duration_range} steps ({dropout_cfg.dropout_duration_range[0]*0.05:.2f}-{dropout_cfg.dropout_duration_range[1]*0.05:.2f}s)")
+            print(f"  RGB dropout: {dropout_cfg.dropout_rgb}")
+            print(f"  Depth dropout: {dropout_cfg.dropout_depth}")
+            print("="*80)
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize dropout wrapper: {e}")
+            print("[WARNING] Continuing without dropout (M1 mode)")
+            import traceback
+            traceback.print_exc()
+
+    # wrap for force sensing (tensile sensor)
+    if args_cli.force_sensing:
+        try:
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.force_sensor_env_wrapper import (
+                VecEnvForceSensorWrapper,
+                ForceSensorConfig,
+            )
+            
+            # Create force sensor config
+            force_cfg = ForceSensorConfig(
+                enabled=True,
+                force_obs_mode=args_cli.force_mode,
+                normalize=True,
+                effort_limit=70.0,  # Franka finger max effort
+                robot_name="robot",
+                object_name="cube_2",
+                ee_frame_name="ee_frame",
+            )
+            
+            # Wrap environment
+            env = VecEnvForceSensorWrapper(env, force_cfg)
+            
+            # Calculate force dims for logging
+            force_dims = {"scalar": 1, "per_finger": 2, "with_closure": 3, "contact_estimate": 2, "grasp_indicator": 3}
+            
+            print("="*80)
+            print(f"[INFO] Force Sensing (Tensile Sensor) ENABLED:")
+            print(f"  Mode: {args_cli.force_mode}")
+            print(f"  Dimensions: {force_dims.get(args_cli.force_mode, 1)}")
+            print(f"  Normalized: True (0-1 range)")
+            print(f"  Added to: proprio observations")
+            print("="*80)
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize force sensor wrapper: {e}")
+            print("[WARNING] Continuing without force sensing")
+            import traceback
+            traceback.print_exc()
 
     start_time = time.time()
 

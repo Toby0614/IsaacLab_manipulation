@@ -19,3 +19,14 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# =============================================================================
+# FORCE SENSING VARIANTS
+# =============================================================================
+# Import force-sensing configs to trigger their gym.register() calls
+from . import pickplace_env_cfg_with_force  # noqa: F401
+
+# The following environments are now available:
+# - Isaac-Franka-PickPlace-Force-v0: Force + closure info (3 dims) [recommended]
+# - Isaac-Franka-PickPlace-Force-Scalar-v0: Single scalar force (1 dim)
+# - Isaac-Franka-PickPlace-Force-GraspIndicator-v0: Grasp quality indicator (3 dims)

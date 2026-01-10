@@ -10,3 +10,9 @@ from isaaclab.envs.mdp import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403
 from .grasp_rewards import *  # noqa: F401, F403
+
+# Modality dropout system
+from .modality_dropout_observations import *  # noqa: F401, F403
+
+# Gripper force sensing (tensile sensor)
+from .gripper_force_observations import *  # noqa: F401, F403

@@ -43,6 +43,17 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+# modality dropout arguments (optional, for robustness evaluation/visualization)
+parser.add_argument(
+    "--dropout_mode",
+    type=str,
+    default="none",
+    choices=["none", "hard", "soft", "mixed"],
+    help="Modality dropout mode during play: none (disabled), hard (blackout), soft (noise), mixed (both).",
+)
+parser.add_argument("--dropout_prob", type=float, default=None, help="Dropout probability per step (override preset).")
+parser.add_argument("--dropout_duration_min", type=int, default=None, help="Min dropout duration (steps).")
+parser.add_argument("--dropout_duration_max", type=int, default=None, help="Max dropout duration (steps).")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -54,6 +65,22 @@ if args_cli.video:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
+# (defensive) strip stray tokens that Hydra's override grammar can't parse (e.g., standalone "\")
+def _sanitize_hydra_overrides(overrides: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    for a in overrides:
+        if a is None:
+            continue
+        s = str(a)
+        if s.strip() == "":
+            continue
+        if s.strip("\\").strip() == "":
+            continue
+        sanitized.append(s)
+    return sanitized
+
+
+hydra_args = _sanitize_hydra_overrides(hydra_args)
 sys.argv = [sys.argv[0]] + hydra_args
 
 # launch omniverse app
@@ -66,6 +93,7 @@ import gymnasium as gym
 import os
 import time
 import torch
+import glob
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -87,6 +115,41 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Manipulation_policy.tasks  # noqa: F401
+
+
+def _resolve_checkpoint_arg(checkpoint_arg: str) -> str:
+    """Resolve a user-provided checkpoint argument to a concrete .pt file.
+
+    Users sometimes pass a *run directory* (e.g., '/tmp/M3_mix' or a log folder)
+    instead of a specific model file. RSL-RL expects a file path for torch.load().
+    """
+    if checkpoint_arg is None:
+        raise ValueError("checkpoint_arg is None")
+
+    p = retrieve_file_path(checkpoint_arg)
+    if os.path.isfile(p):
+        return p
+
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f"Checkpoint path does not exist: {p}")
+
+    # Common patterns in this repo/logs
+    candidates: list[str] = []
+    for pat in ("model_*.pt", "model*.pt", "*.pt"):
+        candidates.extend(glob.glob(os.path.join(p, pat)))
+
+    # Filter out non-files just in case and sort by mtime (newest first)
+    candidates = [c for c in candidates if os.path.isfile(c)]
+    candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"Checkpoint argument '{checkpoint_arg}' resolved to directory '{p}', but no .pt files were found inside."
+        )
+
+    chosen = candidates[0]
+    print(f"[INFO] Resolved checkpoint directory '{p}' -> '{chosen}'")
+    return chosen
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -115,7 +178,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
             return
     elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        resume_path = _resolve_checkpoint_arg(args_cli.checkpoint)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
@@ -130,6 +193,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+
+    # wrap for modality dropout (evaluation during play)
+    if args_cli.dropout_mode != "none":
+        try:
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.dropout_env_wrapper import (
+                VecEnvDropoutWrapper,
+            )
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.modality_dropout_cfg import (
+                HardDropoutTrainingCfg,
+                SoftDropoutTrainingCfg,
+                MixedDropoutTrainingCfg,
+            )
+
+            if args_cli.dropout_mode == "hard":
+                dropout_cfg = HardDropoutTrainingCfg()
+            elif args_cli.dropout_mode == "soft":
+                dropout_cfg = SoftDropoutTrainingCfg()
+            elif args_cli.dropout_mode == "mixed":
+                dropout_cfg = MixedDropoutTrainingCfg()
+
+            # Apply CLI overrides
+            if args_cli.dropout_prob is not None:
+                dropout_cfg.dropout_probability = args_cli.dropout_prob
+            if args_cli.dropout_duration_min is not None and args_cli.dropout_duration_max is not None:
+                dropout_cfg.dropout_duration_range = (args_cli.dropout_duration_min, args_cli.dropout_duration_max)
+
+            env = VecEnvDropoutWrapper(env, dropout_cfg)
+
+            print("=" * 80)
+            print("[INFO] Modality Dropout ENABLED during play:")
+            print(f"  Mode: {dropout_cfg.dropout_mode}")
+            print(f"  Probability: {dropout_cfg.dropout_probability:.3f}")
+            print(f"  Duration range: {dropout_cfg.dropout_duration_range} steps")
+            print(f"  RGB dropout: {dropout_cfg.dropout_rgb}")
+            print(f"  Depth dropout: {dropout_cfg.dropout_depth}")
+            print("=" * 80)
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize dropout wrapper for play: {e}")
+            print("[WARNING] Continuing without dropout during play.")
 
     # wrap for video recording
     if args_cli.video:
