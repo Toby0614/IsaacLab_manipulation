@@ -48,7 +48,10 @@ class PickPlacePhaseDetector:
     
     def __init__(
         self,
-        goal_pos: tuple[float, float, float] = (0.70, 0.20, 0.0203),
+        # NOTE: Default aligned to this repo's Franka pick-and-place config goal:
+        # `.../config/franka/pickplace_env_cfg.py` sets GOAL_POS = (0.21, 0.28, 0.0203).
+        # If you change the task goal, pass it explicitly when constructing this detector.
+        goal_pos: tuple[float, float, float] = (0.21, 0.28, 0.0203),
         table_z: float = 0.0203,
         lift_threshold: float = 0.05,
         grasp_dist_threshold: float = 0.06,

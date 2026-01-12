@@ -9,6 +9,7 @@
 
 import argparse
 import sys
+import re
 
 from isaaclab.app import AppLauncher
 
@@ -54,6 +55,127 @@ parser.add_argument(
 parser.add_argument("--dropout_prob", type=float, default=None, help="Dropout probability per step (override preset).")
 parser.add_argument("--dropout_duration_min", type=int, default=None, help="Min dropout duration (steps).")
 parser.add_argument("--dropout_duration_max", type=int, default=None, help="Max dropout duration (steps).")
+
+# Force sensing (for M2/M4 policies)
+parser.add_argument(
+    "--force_sensing", action="store_true", default=False,
+    help="Enable gripper force sensing (required for M2/M4 policies)."
+)
+parser.add_argument(
+    "--force_mode", type=str, default="grasp_indicator",
+    choices=["scalar", "per_finger", "with_closure", "contact_estimate", "grasp_indicator"],
+    help="Force sensing mode (must match training config)."
+)
+
+# =============================================================================
+# EVALUATION MODE: Systematic dropout robustness evaluation (Variant 1 & 2)
+# =============================================================================
+parser.add_argument(
+    "--eval_dropout",
+    action="store_true",
+    default=False,
+    help="Run systematic dropout evaluation (exits automatically when done).",
+)
+parser.add_argument(
+    "--eval_variant",
+    type=str,
+    default="both",
+    choices=["1", "2", "both"],
+    help="Evaluation variant: 1 (phase-based), 2 (time-based), or both.",
+)
+parser.add_argument(
+    "--eval_phases",
+    type=str,
+    default="reach,grasp,lift,transport,place",
+    help="Comma-separated phases for Variant 1 evaluation.",
+)
+parser.add_argument(
+    "--eval_onset_steps",
+    type=str,
+    default="10,25,50,75,100,125,150",
+    help="Comma-separated onset steps for Variant 2 evaluation.",
+)
+parser.add_argument(
+    "--eval_durations",
+    type=str,
+    default="5,10,20,40,60,80,100",
+    help="Comma-separated dropout durations (steps) for evaluation.",
+)
+parser.add_argument(
+    "--eval_episodes",
+    type=int,
+    default=100,
+    help="Number of episodes per evaluation condition.",
+)
+parser.add_argument(
+    "--eval_output_dir",
+    type=str,
+    default="results/dropout_eval",
+    help="Directory to save evaluation results.",
+)
+parser.add_argument(
+    "--policy_name",
+    type=str,
+    default=None,
+    help="Policy name for evaluation results (auto-detected if not provided).",
+)
+
+# =============================================================================
+# EVALUATION MODE: Systematic POSE CORRUPTION robustness evaluation
+# =============================================================================
+parser.add_argument(
+    "--eval_pose_corruption",
+    action="store_true",
+    default=False,
+    help="Run systematic pose-corruption evaluation on oracle cube_position (exits automatically when done).",
+)
+parser.add_argument(
+    "--pose_eval_variant",
+    type=str,
+    default="both",
+    choices=["1", "2", "both"],
+    help="Pose-eval variant: 1 (phase-based), 2 (time-based), or both.",
+)
+parser.add_argument(
+    "--pose_eval_phases",
+    type=str,
+    default="reach,grasp,lift,transport,place",
+    help="Comma-separated phases for Variant 1 pose evaluation.",
+)
+parser.add_argument(
+    "--pose_eval_onset_steps",
+    type=str,
+    default="10,25,50,75,100,125,150",
+    help="Comma-separated onset steps for Variant 2 pose evaluation.",
+)
+parser.add_argument(
+    "--pose_eval_durations",
+    type=str,
+    default="5,10,20,40,60,80,100",
+    help="Comma-separated corruption durations (steps) for pose evaluation.",
+)
+parser.add_argument(
+    "--pose_eval_modes",
+    type=str,
+    default="hard,freeze",
+    help="Comma-separated pose corruption modes to evaluate (e.g., 'hard,freeze,noise,delay').",
+)
+parser.add_argument(
+    "--pose_eval_episodes",
+    type=int,
+    default=200,
+    help="Number of episodes per evaluation condition for pose corruption.",
+)
+parser.add_argument(
+    "--pose_eval_output_dir",
+    type=str,
+    default="results/pose_eval",
+    help="Directory to save pose-corruption evaluation results.",
+)
+parser.add_argument("--pose_eval_delay_steps", type=int, default=5, help="Delay steps used when pose mode is 'delay'.")
+parser.add_argument("--pose_eval_noise_std", type=float, default=0.01, help="Pose noise std (meters) used for 'noise'.")
+parser.add_argument("--pose_eval_drift_noise_std", type=float, default=0.001, help="Pose drift noise std (meters) used for 'noise'.")
+
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -94,6 +216,10 @@ import os
 import time
 import torch
 import glob
+import json
+import numpy as np
+from datetime import datetime
+from dataclasses import dataclass, asdict
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -117,6 +243,1052 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import Manipulation_policy.tasks  # noqa: F401
 
 
+# =============================================================================
+# EVALUATION DATA STRUCTURES
+# =============================================================================
+
+@dataclass
+class EvalResult:
+    """Single evaluation condition result."""
+    policy_name: str
+    variant: int
+    condition: str  # phase name or onset step
+    duration: int
+    success_rate: float
+    mean_episode_length: float
+    std_episode_length: float
+    num_episodes: int
+    dropout_triggered_rate: float
+
+
+@dataclass
+class EvalSummary:
+    """Summary of evaluation run."""
+    policy_name: str
+    variant: int
+    conditions: list
+    durations: list
+    success_matrix: list  # 2D: [condition x duration]
+    timestamp: str
+    seed: int
+    num_episodes_per_condition: int
+
+
+# =============================================================================
+# EVALUATION FUNCTIONS
+# =============================================================================
+
+def run_evaluation_episodes(
+    env,
+    policy,
+    policy_nn,
+    num_episodes: int,
+    device: str,
+) -> dict:
+    """Run evaluation episodes and collect metrics."""
+    num_envs = env.unwrapped.num_envs
+    
+    successes = []
+    episode_lengths = []
+    dropout_triggered = []
+    
+    episodes_completed = 0
+    obs = env.get_observations()
+    env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    
+    while episodes_completed < num_episodes:
+        with torch.inference_mode():
+            actions = policy(obs)
+            # IsaacLab wrappers may follow either Gymnasium API:
+            #   obs, reward, terminated, truncated, info
+            # or the older VecEnv-style API:
+            #   obs, reward, done, info
+            step_out = env.step(actions)
+            if isinstance(step_out, (tuple, list)) and len(step_out) == 5:
+                obs, rewards, terminated, truncated, info = step_out
+                done = terminated | truncated
+            elif isinstance(step_out, (tuple, list)) and len(step_out) == 4:
+                obs, rewards, done, info = step_out
+                if not torch.is_tensor(done):
+                    done = torch.as_tensor(done, device=device)
+                done = done.to(dtype=torch.bool)
+
+                # Best-effort split of `done` into terminated vs truncated using timeout signals in info.
+                time_outs = None
+                if isinstance(info, dict):
+                    for k in ("time_outs", "timeouts", "time_out"):
+                        if k in info:
+                            time_outs = info[k]
+                            break
+                    if time_outs is None and isinstance(info.get("extras"), dict):
+                        for k in ("time_outs", "timeouts", "time_out"):
+                            if k in info["extras"]:
+                                time_outs = info["extras"][k]
+                                break
+                if time_outs is not None:
+                    if not torch.is_tensor(time_outs):
+                        time_outs = torch.as_tensor(time_outs, device=device)
+                    truncated = time_outs.to(dtype=torch.bool)
+                    terminated = done & ~truncated
+                else:
+                    truncated = torch.zeros_like(done, dtype=torch.bool)
+                    terminated = done
+            else:
+                raise ValueError(f"Unexpected env.step() return of length {len(step_out) if isinstance(step_out, (tuple, list)) else type(step_out)}")
+            env_episode_step += 1
+            
+            done_indices = done.nonzero(as_tuple=False).squeeze(-1)
+            
+            for idx in done_indices.cpu().tolist():
+                if episodes_completed >= num_episodes:
+                    break
+                
+                # Determine success.
+                #
+                # IMPORTANT:
+                # - In IsaacLab, `terminated=True` can mean *any* termination condition fired
+                #   (success OR failure), while `truncated=True` usually means timeout.
+                # - For robustness eval we want true task success, not "episode ended".
+                success = False
+                try:
+                    base_unwrapped = env.unwrapped
+                    if hasattr(base_unwrapped, "termination_manager"):
+                        # `success_grasp` is the success termination term configured in
+                        # `.../config/franka/pickplace_env_cfg.py` for this task.
+                        term = base_unwrapped.termination_manager.get_term("success_grasp")
+                        if torch.is_tensor(term):
+                            success = bool(term[idx].item())
+                        else:
+                            success = bool(term)
+                    else:
+                        success = bool(terminated[idx].item())
+                except Exception:
+                    success = bool(terminated[idx].item())
+                successes.append(float(success))
+                episode_lengths.append(env_episode_step[idx].item())
+                
+                # Check dropout trigger
+                base_env = env
+                while hasattr(base_env, 'env'):
+                    if hasattr(base_env, 'dropout_manager'):
+                        break
+                    base_env = base_env.env
+                
+                triggered = False
+                if hasattr(base_env, 'dropout_manager'):
+                    triggered = base_env.dropout_manager.dropout_triggered_count[idx].item() > 0
+                dropout_triggered.append(float(triggered))
+                
+                episodes_completed += 1
+            
+            if len(done_indices) > 0:
+                env_episode_step[done_indices] = 0
+            
+            policy_nn.reset(done)
+    
+    return {
+        "success_rate": np.mean(successes) if successes else 0.0,
+        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
+        "num_episodes": len(successes),
+        "dropout_triggered_rate": np.mean(dropout_triggered) if dropout_triggered else 0.0,
+    }
+
+
+def run_variant1_eval_shared(
+    env,
+    policy,
+    policy_nn,
+    policy_name: str,
+    phases: list,
+    durations: list,
+    num_episodes: int,
+    device: str,
+    seed: int,
+) -> tuple:
+    """Run Variant 1 (phase-based) evaluation using shared environment."""
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.eval_dropout_wrapper import (
+        Variant1PhaseDropoutManager,
+    )
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.eval_dropout_cfg import (
+        Variant1PhaseDropoutCfg,
+    )
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.phase_detector import (
+        PickPlacePhaseDetector,
+    )
+    
+    results = []
+    success_matrix = []
+    
+    print(f"\n{'='*60}")
+    print(f"VARIANT 1 (Phase-Based) Evaluation: {policy_name}")
+    print(f"Phases: {phases}, Durations: {durations}")
+    print(f"{'='*60}")
+    
+    # Create phase detector
+    phase_detector = PickPlacePhaseDetector()
+    
+    print("  Starting evaluation grid...", flush=True)
+    
+    for phase in phases:
+        phase_results = []
+        
+        for duration in durations:
+            print(f"  Phase={phase}, Duration={duration}...", end=" ", flush=True)
+            
+            # Create NEW dropout manager with this config
+            cfg = Variant1PhaseDropoutCfg(
+                target_phase=phase,
+                dropout_duration_steps=duration,
+            )
+            dropout_manager = Variant1PhaseDropoutManager(
+                cfg=cfg,
+                num_envs=env.unwrapped.num_envs,
+                device=device,
+            )
+            
+            # Attach to environment
+            env.unwrapped.dropout_manager = dropout_manager
+            
+            # Run evaluation with phase detection
+            metrics = run_evaluation_episodes_v1(
+                env, policy, policy_nn, num_episodes, device, 
+                dropout_manager, phase_detector
+            )
+            
+            result = EvalResult(
+                policy_name=policy_name,
+                variant=1,
+                condition=phase,
+                duration=duration,
+                **metrics,
+            )
+            results.append(result)
+            phase_results.append(metrics["success_rate"])
+            
+            print(f"Success: {metrics['success_rate']:.1%}, Dropout triggered: {metrics['dropout_triggered_rate']:.1%}")
+        
+        success_matrix.append(phase_results)
+    
+    summary = EvalSummary(
+        policy_name=policy_name,
+        variant=1,
+        conditions=phases,
+        durations=durations,
+        success_matrix=success_matrix,
+        timestamp=datetime.now().isoformat(),
+        seed=seed,
+        num_episodes_per_condition=num_episodes,
+    )
+    
+    return summary, results
+
+
+def apply_dropout_to_obs(obs, dropout_manager, device: str):
+    """Manually apply dropout (blackout) to camera/visual observations.
+    
+    Handles both dict/TensorDict and tensor observations.
+    For dict: looks for keys containing camera-related terms or 4D image tensors
+    For tensor: applies dropout if tensor looks like images (4D)
+    """
+    if not dropout_manager.dropout_active.any():
+        return obs
+    
+    mask = dropout_manager.dropout_active  # (B,)
+    
+    def apply_blackout(tensor: torch.Tensor, force: bool = False) -> torch.Tensor:
+        """Apply blackout to a tensor.
+        
+        Args:
+            tensor: Input tensor
+            force: If True, always apply blackout to 4D tensors (for explicit camera keys)
+                   If False, only apply if tensor looks like typical image data
+        """
+        if not torch.is_tensor(tensor):
+            return tensor
+        if tensor.ndim != 4:
+            return tensor
+        
+        # If not forced, check if this looks like image data (B, C, H, W) or (B, H, W, C)
+        # Multi-camera setups can have many channels (e.g., 7 = 2 cams × 3 RGB + 1 depth)
+        if not force:
+            b, d1, d2, d3 = tensor.shape
+            # Heuristic: spatial dims (H, W) are usually larger than channel dim
+            # If d2 and d3 are both >= 16, it's likely (B, C, H, W) format
+            is_image = (d2 >= 16 and d3 >= 16) or (d1 <= 4) or (d3 <= 4)
+            if not is_image:
+                return tensor
+        
+        val_out = tensor.clone()
+        broadcast_mask = mask.view(-1, 1, 1, 1)
+        val_out = torch.where(broadcast_mask, torch.zeros_like(val_out), val_out)
+        return val_out
+    
+    # Handle dict-like observations (including TensorDict)
+    # TensorDict from tensordict library behaves like a dict
+    from collections.abc import Mapping
+    if isinstance(obs, Mapping):
+        # Expanded list of camera-related key substrings
+        # 'cam' matches 'multi_cam', 'camera' matches 'wrist_camera', etc.
+        camera_keywords = ['cam', 'camera', 'image', 'rgb', 'depth', 'visual', 'pixels', 'img']
+        
+        # Try to preserve TensorDict type if possible
+        try:
+            from tensordict import TensorDict
+            is_tensordict = isinstance(obs, TensorDict)
+        except ImportError:
+            is_tensordict = False
+        
+        obs_out = {}
+        for key in obs.keys():
+            val = obs[key]
+            key_lower = key.lower()
+            
+            # Check if key suggests camera/visual data
+            is_camera_key = any(kw in key_lower for kw in camera_keywords)
+            
+            if is_camera_key and torch.is_tensor(val) and val.ndim == 4:
+                # Explicit camera key - force blackout regardless of channel count
+                obs_out[key] = apply_blackout(val, force=True)
+            elif torch.is_tensor(val) and val.ndim == 4:
+                # Unknown key but 4D tensor - use heuristic to check if it's image-like
+                obs_out[key] = apply_blackout(val, force=False)
+            else:
+                obs_out[key] = val
+        
+        # Convert back to TensorDict if input was TensorDict
+        if is_tensordict:
+            return TensorDict(obs_out, batch_size=obs.batch_size)
+        return obs_out
+    
+    # Handle tensor observations (might be concatenated)
+    elif torch.is_tensor(obs):
+        return apply_blackout(obs)
+    
+    return obs
+
+
+def run_evaluation_episodes_v1(
+    env,
+    policy,
+    policy_nn,
+    num_episodes: int,
+    device: str,
+    dropout_manager,
+    phase_detector,
+) -> dict:
+    """Run evaluation episodes for Variant 1 with phase detection."""
+    num_envs = env.unwrapped.num_envs
+    
+    successes = []
+    episode_lengths = []
+    dropout_triggered = []
+    
+    episodes_completed = 0
+    
+    # Reset dropout manager for this condition
+    all_env_ids = torch.arange(num_envs, device=device)
+    dropout_manager.reset(all_env_ids)
+    
+    # Get current observations (don't reset env - causes inference mode issues)
+    obs = env.get_observations()
+    
+    # Debug: show observation structure (once per variant)
+    if not hasattr(run_evaluation_episodes_v1, '_obs_structure_printed'):
+        run_evaluation_episodes_v1._obs_structure_printed = True
+        print(f"  [DEBUG] Observation type: {type(obs).__name__}")
+        if hasattr(obs, 'keys'):
+            camera_keywords = ['cam', 'camera', 'image', 'rgb', 'depth', 'visual', 'pixels', 'img']
+            for key in obs.keys():
+                val = obs[key]
+                shape = val.shape if torch.is_tensor(val) else "N/A"
+                is_camera = any(kw in key.lower() for kw in camera_keywords) or (torch.is_tensor(val) and val.ndim == 4)
+                marker = " <-- WILL BLACKOUT" if is_camera else ""
+                print(f"    Key: '{key}', Shape: {shape}{marker}")
+    
+    env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    
+    while episodes_completed < num_episodes:
+        with torch.inference_mode():
+            # Update phases and dropout state BEFORE getting actions
+            try:
+                phases = phase_detector.detect_phases(env.unwrapped)
+                dropout_manager.update_phases(phases)
+            except Exception:
+                pass
+            dropout_manager.step()
+            
+            # Apply dropout to observations
+            obs_with_dropout = apply_dropout_to_obs(obs, dropout_manager, device)
+            
+            actions = policy(obs_with_dropout)
+            step_out = env.step(actions)
+            
+            if isinstance(step_out, (tuple, list)) and len(step_out) == 5:
+                obs, rewards, terminated, truncated, info = step_out
+                done = terminated | truncated
+            elif isinstance(step_out, (tuple, list)) and len(step_out) == 4:
+                obs, rewards, done, info = step_out
+                if not torch.is_tensor(done):
+                    done = torch.as_tensor(done, device=device)
+                done = done.to(dtype=torch.bool)
+                truncated = torch.zeros_like(done, dtype=torch.bool)
+                terminated = done
+            else:
+                raise ValueError(f"Unexpected env.step() return")
+            
+            env_episode_step += 1
+            
+            done_indices = done.nonzero(as_tuple=False).squeeze(-1)
+            
+            for idx in done_indices.cpu().tolist():
+                if episodes_completed >= num_episodes:
+                    break
+                
+                # See `run_evaluation_episodes` for rationale: only count true task success.
+                success = False
+                try:
+                    if hasattr(env.unwrapped, "termination_manager"):
+                        term = env.unwrapped.termination_manager.get_term("success_grasp")
+                        if torch.is_tensor(term):
+                            success = bool(term[idx].item())
+                        else:
+                            success = bool(term)
+                    else:
+                        success = bool(terminated[idx].item())
+                except Exception:
+                    success = bool(terminated[idx].item())
+                successes.append(float(success))
+                episode_lengths.append(env_episode_step[idx].item())
+                
+                triggered = dropout_manager.dropout_triggered_count[idx].item() > 0
+                dropout_triggered.append(float(triggered))
+                
+                episodes_completed += 1
+            
+            if len(done_indices) > 0:
+                env_episode_step[done_indices] = 0
+                dropout_manager.reset(done_indices)
+            
+            policy_nn.reset(done)
+    
+    return {
+        "success_rate": np.mean(successes) if successes else 0.0,
+        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
+        "num_episodes": len(successes),
+        "dropout_triggered_rate": np.mean(dropout_triggered) if dropout_triggered else 0.0,
+    }
+
+
+def _infer_force_dim(force_mode: str) -> int:
+    force_dims = {
+        "scalar": 1,
+        "per_finger": 2,
+        "with_closure": 3,
+        "contact_estimate": 2,
+        "grasp_indicator": 3,
+    }
+    return int(force_dims.get(force_mode, 0))
+
+
+def apply_pose_corruption_to_obs(obs, pose_manager, force_dim: int):
+    """Corrupt the cube_position slice in obs['proprio'].
+
+    Assumptions (by construction in this repo):
+    - `cube_position` is 3 dims appended at the end of the *base* proprio vector.
+    - If a force wrapper is used, force dims are appended AFTER base proprio, so cube_position becomes
+      the slice [-force_dim-3 : -force_dim] (or the last 3 dims if force_dim==0).
+    """
+    if obs is None:
+        return obs
+    if not hasattr(obs, "keys") or "proprio" not in obs:
+        return obs
+
+    proprio = obs["proprio"]
+    if not torch.is_tensor(proprio) or proprio.ndim != 2:
+        return obs
+
+    if proprio.shape[1] < (3 + max(force_dim, 0)):
+        return obs
+
+    if force_dim > 0:
+        cube_slice = slice(-(force_dim + 3), -force_dim)
+    else:
+        cube_slice = slice(-3, None)
+
+    cube_pos = proprio[:, cube_slice]
+    cube_pos_corrupt = pose_manager.apply(cube_pos)
+
+    obs_out = obs
+    # TensorDict supports item assignment like dict; dict too.
+    obs_out["proprio"] = torch.cat([proprio[:, : cube_slice.start], cube_pos_corrupt, proprio[:, cube_slice.stop :]], dim=1) if force_dim > 0 else torch.cat([proprio[:, :-3], cube_pos_corrupt], dim=1)
+    return obs_out
+
+
+def run_evaluation_episodes_pose_v1(
+    env,
+    policy,
+    policy_nn,
+    num_episodes: int,
+    device: str,
+    pose_manager,
+    phase_detector,
+    force_dim: int,
+) -> dict:
+    """Run evaluation episodes for pose corruption Variant 1 (phase-triggered)."""
+    num_envs = env.unwrapped.num_envs
+
+    successes = []
+    episode_lengths = []
+    triggered = []
+
+    episodes_completed = 0
+
+    all_env_ids = torch.arange(num_envs, device=device)
+    pose_manager.reset(all_env_ids)
+
+    obs = env.get_observations()
+    env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+
+    while episodes_completed < num_episodes:
+        with torch.inference_mode():
+            # Update phases and pose manager BEFORE action
+            try:
+                phases = phase_detector.detect_phases(env.unwrapped)
+                pose_manager.update_phases(phases)
+            except Exception:
+                pass
+            pose_manager.step()
+
+            obs_corrupt = apply_pose_corruption_to_obs(obs, pose_manager, force_dim=force_dim)
+            actions = policy(obs_corrupt)
+            step_out = env.step(actions)
+
+            if isinstance(step_out, (tuple, list)) and len(step_out) == 5:
+                obs, rewards, terminated, truncated, info = step_out
+                done = terminated | truncated
+            elif isinstance(step_out, (tuple, list)) and len(step_out) == 4:
+                obs, rewards, done, info = step_out
+                if not torch.is_tensor(done):
+                    done = torch.as_tensor(done, device=device)
+                done = done.to(dtype=torch.bool)
+                truncated = torch.zeros_like(done, dtype=torch.bool)
+                terminated = done
+            else:
+                raise ValueError("Unexpected env.step() return")
+
+            env_episode_step += 1
+            done_indices = done.nonzero(as_tuple=False).squeeze(-1)
+
+            for idx in done_indices.cpu().tolist():
+                if episodes_completed >= num_episodes:
+                    break
+
+                # success via termination_manager term (task success)
+                success = False
+                try:
+                    if hasattr(env.unwrapped, "termination_manager"):
+                        term = env.unwrapped.termination_manager.get_term("success_grasp")
+                        success = bool(term[idx].item()) if torch.is_tensor(term) else bool(term)
+                    else:
+                        success = bool(terminated[idx].item())
+                except Exception:
+                    success = bool(terminated[idx].item())
+
+                successes.append(float(success))
+                episode_lengths.append(env_episode_step[idx].item())
+                triggered.append(float(pose_manager.triggered_count[idx].item() > 0))
+                episodes_completed += 1
+
+            if len(done_indices) > 0:
+                env_episode_step[done_indices] = 0
+                pose_manager.reset(done_indices)
+
+            policy_nn.reset(done)
+
+    return {
+        "success_rate": np.mean(successes) if successes else 0.0,
+        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
+        "num_episodes": len(successes),
+        "dropout_triggered_rate": np.mean(triggered) if triggered else 0.0,
+    }
+
+
+def run_evaluation_episodes_pose_v2(
+    env,
+    policy,
+    policy_nn,
+    num_episodes: int,
+    device: str,
+    pose_manager,
+    force_dim: int,
+) -> dict:
+    """Run evaluation episodes for pose corruption Variant 2 (time-triggered)."""
+    num_envs = env.unwrapped.num_envs
+
+    successes = []
+    episode_lengths = []
+    triggered = []
+
+    episodes_completed = 0
+    all_env_ids = torch.arange(num_envs, device=device)
+    pose_manager.reset(all_env_ids)
+
+    obs = env.get_observations()
+    env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+
+    while episodes_completed < num_episodes:
+        with torch.inference_mode():
+            pose_manager.step()
+            obs_corrupt = apply_pose_corruption_to_obs(obs, pose_manager, force_dim=force_dim)
+            actions = policy(obs_corrupt)
+            step_out = env.step(actions)
+
+            if isinstance(step_out, (tuple, list)) and len(step_out) == 5:
+                obs, rewards, terminated, truncated, info = step_out
+                done = terminated | truncated
+            elif isinstance(step_out, (tuple, list)) and len(step_out) == 4:
+                obs, rewards, done, info = step_out
+                if not torch.is_tensor(done):
+                    done = torch.as_tensor(done, device=device)
+                done = done.to(dtype=torch.bool)
+                truncated = torch.zeros_like(done, dtype=torch.bool)
+                terminated = done
+            else:
+                raise ValueError("Unexpected env.step() return")
+
+            env_episode_step += 1
+            done_indices = done.nonzero(as_tuple=False).squeeze(-1)
+
+            for idx in done_indices.cpu().tolist():
+                if episodes_completed >= num_episodes:
+                    break
+
+                success = False
+                try:
+                    if hasattr(env.unwrapped, "termination_manager"):
+                        term = env.unwrapped.termination_manager.get_term("success_grasp")
+                        success = bool(term[idx].item()) if torch.is_tensor(term) else bool(term)
+                    else:
+                        success = bool(terminated[idx].item())
+                except Exception:
+                    success = bool(terminated[idx].item())
+
+                successes.append(float(success))
+                episode_lengths.append(env_episode_step[idx].item())
+                triggered.append(float(pose_manager.triggered_count[idx].item() > 0))
+                episodes_completed += 1
+
+            if len(done_indices) > 0:
+                env_episode_step[done_indices] = 0
+                pose_manager.reset(done_indices)
+
+            policy_nn.reset(done)
+
+    return {
+        "success_rate": np.mean(successes) if successes else 0.0,
+        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
+        "num_episodes": len(successes),
+        "dropout_triggered_rate": np.mean(triggered) if triggered else 0.0,
+    }
+
+
+def run_variant2_eval_shared(
+    env,
+    policy,
+    policy_nn,
+    policy_name: str,
+    onset_steps: list,
+    durations: list,
+    num_episodes: int,
+    device: str,
+    seed: int,
+) -> tuple:
+    """Run Variant 2 (time-based) evaluation using shared environment."""
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.eval_dropout_wrapper import (
+        Variant2TimeDropoutManager,
+    )
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.eval_dropout_cfg import (
+        Variant2TimeDropoutCfg,
+    )
+    
+    results = []
+    success_matrix = []
+    
+    print(f"\n{'='*60}")
+    print(f"VARIANT 2 (Time-Based) Evaluation: {policy_name}")
+    print(f"Onset steps: {onset_steps}, Durations: {durations}")
+    print(f"{'='*60}")
+    
+    print("  Starting evaluation grid...", flush=True)
+    
+    for onset in onset_steps:
+        onset_results = []
+        
+        for duration in durations:
+            print(f"  Onset={onset}, Duration={duration}...", end=" ", flush=True)
+            
+            # Create NEW dropout manager with this config
+            cfg = Variant2TimeDropoutCfg(
+                onset_step=onset,
+                dropout_duration_steps=duration,
+            )
+            dropout_manager = Variant2TimeDropoutManager(
+                cfg=cfg,
+                num_envs=env.unwrapped.num_envs,
+                device=device,
+            )
+            
+            # Attach to environment
+            env.unwrapped.dropout_manager = dropout_manager
+            
+            # Run evaluation
+            metrics = run_evaluation_episodes_v2(
+                env, policy, policy_nn, num_episodes, device, dropout_manager
+            )
+            
+            result = EvalResult(
+                policy_name=policy_name,
+                variant=2,
+                condition=str(onset),
+                duration=duration,
+                **metrics,
+            )
+            results.append(result)
+            onset_results.append(metrics["success_rate"])
+            
+            print(f"Success: {metrics['success_rate']:.1%}, Dropout triggered: {metrics['dropout_triggered_rate']:.1%}")
+        
+        success_matrix.append(onset_results)
+    
+    summary = EvalSummary(
+        policy_name=policy_name,
+        variant=2,
+        conditions=[str(o) for o in onset_steps],
+        durations=durations,
+        success_matrix=success_matrix,
+        timestamp=datetime.now().isoformat(),
+        seed=seed,
+        num_episodes_per_condition=num_episodes,
+    )
+    
+    return summary, results
+
+
+def run_pose_variant1_eval_shared(
+    env,
+    policy,
+    policy_nn,
+    policy_name: str,
+    phases: list,
+    durations: list,
+    modes: list[str],
+    num_episodes: int,
+    device: str,
+    seed: int,
+    force_dim: int,
+    pose_delay_steps: int,
+    pose_noise_std: float,
+    pose_drift_noise_std: float,
+) -> list[tuple[EvalSummary, list]]:
+    """Run pose-corruption Variant 1 evaluation for each mode (phase-based)."""
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.phase_detector import PickPlacePhaseDetector
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.pose_corruption_cfg import PoseCorruptionCfg
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.eval_pose_corruption_manager import (
+        PhaseTriggeredPoseCorruptionManager,
+    )
+
+    phase_detector = PickPlacePhaseDetector()
+    outputs: list[tuple[EvalSummary, list]] = []
+
+    print(f"\n{'='*60}")
+    print(f"POSE CORRUPTION EVAL - VARIANT 1 (Phase-Based): {policy_name}")
+    print(f"Phases: {phases}, Durations: {durations}, Modes: {modes}")
+    print(f"{'='*60}")
+
+    for mode in modes:
+        results = []
+        success_matrix = []
+        print(f"\n--- Mode: {mode} ---", flush=True)
+
+        base_cfg = PoseCorruptionCfg(
+            enabled=True,
+            mode=mode,
+            event_probability=0.0,
+            duration_range=(1, 1),
+            delay_steps=int(pose_delay_steps),
+            noise_std=float(pose_noise_std),
+            drift_noise_std=float(pose_drift_noise_std),
+        )
+
+        for phase in phases:
+            phase_results = []
+            for duration in durations:
+                print(f"  Phase={phase}, Duration={duration}...", end=" ", flush=True)
+                pose_manager = PhaseTriggeredPoseCorruptionManager(
+                    base_cfg,
+                    target_phase=phase,
+                    duration_steps=int(duration),
+                    trigger_once_per_episode=True,
+                    require_stable_phase=True,
+                    stable_phase_steps=3,
+                    phase_entry_delay=0,
+                    num_envs=env.unwrapped.num_envs,
+                    device=device,
+                )
+                env.unwrapped.pose_corruption_manager = pose_manager
+
+                metrics = run_evaluation_episodes_pose_v1(
+                    env, policy, policy_nn, num_episodes, device,
+                    pose_manager, phase_detector, force_dim=force_dim
+                )
+
+                result = EvalResult(
+                    policy_name=policy_name,
+                    variant=1,
+                    condition=phase,
+                    duration=int(duration),
+                    **metrics,
+                )
+                results.append(result)
+                phase_results.append(metrics["success_rate"])
+                print(f"Success: {metrics['success_rate']:.1%}, Pose corrupted: {metrics['dropout_triggered_rate']:.1%}")
+
+            success_matrix.append(phase_results)
+
+        summary = EvalSummary(
+            policy_name=f"{policy_name}_pose_{mode}",
+            variant=1,
+            conditions=phases,
+            durations=durations,
+            success_matrix=success_matrix,
+            timestamp=datetime.now().isoformat(),
+            seed=seed,
+            num_episodes_per_condition=num_episodes,
+        )
+        outputs.append((summary, results))
+
+    return outputs
+
+
+def run_pose_variant2_eval_shared(
+    env,
+    policy,
+    policy_nn,
+    policy_name: str,
+    onset_steps: list,
+    durations: list,
+    modes: list[str],
+    num_episodes: int,
+    device: str,
+    seed: int,
+    force_dim: int,
+    pose_delay_steps: int,
+    pose_noise_std: float,
+    pose_drift_noise_std: float,
+) -> list[tuple[EvalSummary, list]]:
+    """Run pose-corruption Variant 2 evaluation for each mode (time-based)."""
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.pose_corruption_cfg import PoseCorruptionCfg
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.eval_pose_corruption_manager import (
+        TimeTriggeredPoseCorruptionManager,
+    )
+
+    outputs: list[tuple[EvalSummary, list]] = []
+
+    print(f"\n{'='*60}")
+    print(f"POSE CORRUPTION EVAL - VARIANT 2 (Time-Based): {policy_name}")
+    print(f"Onset steps: {onset_steps}, Durations: {durations}, Modes: {modes}")
+    print(f"{'='*60}")
+
+    for mode in modes:
+        results = []
+        success_matrix = []
+        print(f"\n--- Mode: {mode} ---", flush=True)
+
+        base_cfg = PoseCorruptionCfg(
+            enabled=True,
+            mode=mode,
+            event_probability=0.0,
+            duration_range=(1, 1),
+            delay_steps=int(pose_delay_steps),
+            noise_std=float(pose_noise_std),
+            drift_noise_std=float(pose_drift_noise_std),
+        )
+
+        for onset in onset_steps:
+            onset_results = []
+            for duration in durations:
+                print(f"  Onset={onset}, Duration={duration}...", end=" ", flush=True)
+                pose_manager = TimeTriggeredPoseCorruptionManager(
+                    base_cfg,
+                    onset_step=int(onset),
+                    duration_steps=int(duration),
+                    num_envs=env.unwrapped.num_envs,
+                    device=device,
+                )
+                env.unwrapped.pose_corruption_manager = pose_manager
+
+                metrics = run_evaluation_episodes_pose_v2(
+                    env, policy, policy_nn, num_episodes, device,
+                    pose_manager, force_dim=force_dim
+                )
+
+                result = EvalResult(
+                    policy_name=policy_name,
+                    variant=2,
+                    condition=str(onset),
+                    duration=int(duration),
+                    **metrics,
+                )
+                results.append(result)
+                onset_results.append(metrics["success_rate"])
+                print(f"Success: {metrics['success_rate']:.1%}, Pose corrupted: {metrics['dropout_triggered_rate']:.1%}")
+
+            success_matrix.append(onset_results)
+
+        summary = EvalSummary(
+            policy_name=f"{policy_name}_pose_{mode}",
+            variant=2,
+            conditions=[str(o) for o in onset_steps],
+            durations=durations,
+            success_matrix=success_matrix,
+            timestamp=datetime.now().isoformat(),
+            seed=seed,
+            num_episodes_per_condition=num_episodes,
+        )
+        outputs.append((summary, results))
+
+    return outputs
+
+
+def run_evaluation_episodes_v2(
+    env,
+    policy,
+    policy_nn,
+    num_episodes: int,
+    device: str,
+    dropout_manager,
+) -> dict:
+    """Run evaluation episodes for Variant 2 (time-based dropout)."""
+    num_envs = env.unwrapped.num_envs
+    
+    successes = []
+    episode_lengths = []
+    dropout_triggered = []
+    
+    episodes_completed = 0
+    
+    # Reset dropout manager for this condition
+    all_env_ids = torch.arange(num_envs, device=device)
+    dropout_manager.reset(all_env_ids)
+    
+    # Get current observations (don't reset env - causes inference mode issues)
+    obs = env.get_observations()
+    
+    env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    
+    while episodes_completed < num_episodes:
+        with torch.inference_mode():
+            # Update dropout state BEFORE getting actions (time-based)
+            dropout_manager.step()
+            
+            # Apply dropout to observations
+            obs_with_dropout = apply_dropout_to_obs(obs, dropout_manager, device)
+            
+            actions = policy(obs_with_dropout)
+            step_out = env.step(actions)
+            
+            if isinstance(step_out, (tuple, list)) and len(step_out) == 5:
+                obs, rewards, terminated, truncated, info = step_out
+                done = terminated | truncated
+            elif isinstance(step_out, (tuple, list)) and len(step_out) == 4:
+                obs, rewards, done, info = step_out
+                if not torch.is_tensor(done):
+                    done = torch.as_tensor(done, device=device)
+                done = done.to(dtype=torch.bool)
+                truncated = torch.zeros_like(done, dtype=torch.bool)
+                terminated = done
+            else:
+                raise ValueError(f"Unexpected env.step() return")
+            
+            env_episode_step += 1
+            
+            done_indices = done.nonzero(as_tuple=False).squeeze(-1)
+            
+            for idx in done_indices.cpu().tolist():
+                if episodes_completed >= num_episodes:
+                    break
+                
+                # See `run_evaluation_episodes` for rationale: only count true task success.
+                success = False
+                try:
+                    if hasattr(env.unwrapped, "termination_manager"):
+                        term = env.unwrapped.termination_manager.get_term("success_grasp")
+                        if torch.is_tensor(term):
+                            success = bool(term[idx].item())
+                        else:
+                            success = bool(term)
+                    else:
+                        success = bool(terminated[idx].item())
+                except Exception:
+                    success = bool(terminated[idx].item())
+                successes.append(float(success))
+                episode_lengths.append(env_episode_step[idx].item())
+                
+                triggered = dropout_manager.dropout_triggered_count[idx].item() > 0
+                dropout_triggered.append(float(triggered))
+                
+                episodes_completed += 1
+            
+            if len(done_indices) > 0:
+                env_episode_step[done_indices] = 0
+                dropout_manager.reset(done_indices)
+            
+            policy_nn.reset(done)
+    
+    return {
+        "success_rate": np.mean(successes) if successes else 0.0,
+        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
+        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
+        "num_episodes": len(successes),
+        "dropout_triggered_rate": np.mean(dropout_triggered) if dropout_triggered else 0.0,
+    }
+
+
+def save_eval_results(output_dir: str, summary: EvalSummary, results: list):
+    """Save evaluation results to files."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    variant_str = f"variant{summary.variant}"
+    filename_base = f"{summary.policy_name}_{variant_str}"
+    
+    # Save summary JSON
+    summary_path = os.path.join(output_dir, f"{filename_base}_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(asdict(summary), f, indent=2)
+    print(f"  Saved: {summary_path}")
+    
+    # Save results JSON
+    results_path = os.path.join(output_dir, f"{filename_base}_results.json")
+    with open(results_path, 'w') as f:
+        json.dump([asdict(r) for r in results], f, indent=2)
+    
+    # Save CSV matrix
+    import csv
+    csv_path = os.path.join(output_dir, f"{filename_base}_matrix.csv")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        header = ["condition"] + [str(d) for d in summary.durations]
+        writer.writerow(header)
+        for i, cond in enumerate(summary.conditions):
+            row = [cond] + [f"{v:.4f}" for v in summary.success_matrix[i]]
+            writer.writerow(row)
+    print(f"  Saved: {csv_path}")
+
+
 def _resolve_checkpoint_arg(checkpoint_arg: str) -> str:
     """Resolve a user-provided checkpoint argument to a concrete .pt file.
 
@@ -138,8 +1310,26 @@ def _resolve_checkpoint_arg(checkpoint_arg: str) -> str:
     for pat in ("model_*.pt", "model*.pt", "*.pt"):
         candidates.extend(glob.glob(os.path.join(p, pat)))
 
-    # Filter out non-files just in case and sort by mtime (newest first)
-    candidates = [c for c in candidates if os.path.isfile(c)]
+    # Filter out non-files just in case and de-duplicate (patterns overlap).
+    candidates = sorted({c for c in candidates if os.path.isfile(c)})
+
+    # NOTE: `retrieve_file_path()` may copy files into `/tmp/...` and change mtimes unpredictably.
+    # Prefer the numerically-largest training step encoded in filenames like `model_1000.pt`.
+    step_candidates: list[tuple[int, str]] = []
+    for c in candidates:
+        name = os.path.basename(c)
+        m = re.match(r"^model[_-]?(\d+)\.pt$", name)
+        if m:
+            step_candidates.append((int(m.group(1)), c))
+
+    if step_candidates:
+        # Max step wins; tie-break by mtime.
+        step_candidates.sort(key=lambda t: (t[0], os.path.getmtime(t[1])), reverse=True)
+        chosen = step_candidates[0][1]
+        print(f"[INFO] Resolved checkpoint directory '{p}' -> '{chosen}'")
+        return chosen
+
+    # Fallback: newest by mtime for non-standard filenames.
     candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
 
     if not candidates:
@@ -187,6 +1377,263 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    # =========================================================================
+    # EVALUATION MODE: Run systematic dropout evaluation and exit
+    # =========================================================================
+    if args_cli.eval_pose_corruption:
+        print("\n" + "=" * 70)
+        print("POSE CORRUPTION ROBUSTNESS EVALUATION MODE (poe3.pdf)")
+        print("=" * 70)
+
+        phases = [p.strip() for p in args_cli.pose_eval_phases.split(",")]
+        onset_steps = [int(s.strip()) for s in args_cli.pose_eval_onset_steps.split(",")]
+        durations = [int(d.strip()) for d in args_cli.pose_eval_durations.split(",")]
+        modes = [m.strip() for m in args_cli.pose_eval_modes.split(",") if m.strip()]
+
+        policy_name = args_cli.policy_name
+        if policy_name is None:
+            policy_name = os.path.basename(os.path.dirname(resume_path))
+
+        print(f"Policy: {policy_name}")
+        print(f"Checkpoint: {resume_path}")
+        print(f"Variant: {args_cli.pose_eval_variant}")
+        print(f"Modes: {modes}")
+        print(f"Episodes per condition: {args_cli.pose_eval_episodes}")
+        print(f"Output: {args_cli.pose_eval_output_dir}")
+        print("=" * 70)
+
+        device = agent_cfg.device
+        all_summaries = []
+
+        # Create environment ONCE
+        print("\nCreating environment (one-time for pose eval)...", flush=True)
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
+
+        # Add force sensor wrapper if needed
+        if args_cli.force_sensing:
+            try:
+                from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.force_sensor_env_wrapper import (
+                    VecEnvForceSensorWrapper,
+                    ForceSensorConfig,
+                )
+                force_cfg = ForceSensorConfig(
+                    enabled=True,
+                    force_obs_mode=args_cli.force_mode,
+                    normalize=True,
+                    effort_limit=70.0,
+                    robot_name="robot",
+                    object_name="cube_2",
+                    ee_frame_name="ee_frame",
+                )
+                env = VecEnvForceSensorWrapper(env, force_cfg)
+                print(f"  Force sensing enabled: mode={args_cli.force_mode}")
+            except Exception as e:
+                print(f"[ERROR] Failed to add force sensor wrapper: {e}")
+                raise
+
+        force_dim = _infer_force_dim(args_cli.force_mode) if args_cli.force_sensing else 0
+
+        # Wrap for RSL-RL
+        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+        # Load policy ONCE
+        print("Loading policy (one-time for pose eval)...", flush=True)
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(resume_path)
+
+        policy = runner.get_inference_policy(device=device)
+        try:
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            policy_nn = runner.alg.actor_critic
+
+        # Run Variant 1
+        if args_cli.pose_eval_variant in ["1", "both"]:
+            outputs = run_pose_variant1_eval_shared(
+                env=env,
+                policy=policy,
+                policy_nn=policy_nn,
+                policy_name=policy_name,
+                phases=phases,
+                durations=durations,
+                modes=modes,
+                num_episodes=args_cli.pose_eval_episodes,
+                device=device,
+                seed=agent_cfg.seed,
+                force_dim=force_dim,
+                pose_delay_steps=args_cli.pose_eval_delay_steps,
+                pose_noise_std=args_cli.pose_eval_noise_std,
+                pose_drift_noise_std=args_cli.pose_eval_drift_noise_std,
+            )
+            for summary, results in outputs:
+                save_eval_results(args_cli.pose_eval_output_dir, summary, results)
+                all_summaries.append(summary)
+
+        # Run Variant 2
+        if args_cli.pose_eval_variant in ["2", "both"]:
+            outputs = run_pose_variant2_eval_shared(
+                env=env,
+                policy=policy,
+                policy_nn=policy_nn,
+                policy_name=policy_name,
+                onset_steps=onset_steps,
+                durations=durations,
+                modes=modes,
+                num_episodes=args_cli.pose_eval_episodes,
+                device=device,
+                seed=agent_cfg.seed,
+                force_dim=force_dim,
+                pose_delay_steps=args_cli.pose_eval_delay_steps,
+                pose_noise_std=args_cli.pose_eval_noise_std,
+                pose_drift_noise_std=args_cli.pose_eval_drift_noise_std,
+            )
+            for summary, results in outputs:
+                save_eval_results(args_cli.pose_eval_output_dir, summary, results)
+                all_summaries.append(summary)
+
+        env.close()
+
+        combined_path = os.path.join(args_cli.pose_eval_output_dir, f"{policy_name}_pose_all_summaries.json")
+        os.makedirs(args_cli.pose_eval_output_dir, exist_ok=True)
+        with open(combined_path, "w") as f:
+            json.dump([asdict(s) for s in all_summaries], f, indent=2)
+
+        print("\n" + "=" * 70)
+        print("POSE EVALUATION COMPLETE")
+        print(f"Results saved to: {args_cli.pose_eval_output_dir}")
+        print("=" * 70)
+        return
+
+    if args_cli.eval_dropout:
+        print("\n" + "=" * 70)
+        print("DROPOUT ROBUSTNESS EVALUATION MODE")
+        print("=" * 70)
+        
+        # Parse evaluation parameters
+        phases = [p.strip() for p in args_cli.eval_phases.split(",")]
+        onset_steps = [int(s.strip()) for s in args_cli.eval_onset_steps.split(",")]
+        durations = [int(d.strip()) for d in args_cli.eval_durations.split(",")]
+        
+        # Auto-detect policy name from checkpoint path
+        policy_name = args_cli.policy_name
+        if policy_name is None:
+            policy_name = os.path.basename(os.path.dirname(resume_path))
+        
+        print(f"Policy: {policy_name}")
+        print(f"Checkpoint: {resume_path}")
+        print(f"Variant: {args_cli.eval_variant}")
+        print(f"Episodes per condition: {args_cli.eval_episodes}")
+        print(f"Output: {args_cli.eval_output_dir}")
+        print("=" * 70)
+        
+        device = agent_cfg.device
+        all_summaries = []
+        
+        # Create environment ONCE for all variants
+        print("\nCreating environment (one-time for all variants)...", flush=True)
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
+        
+        # Add force sensor wrapper if needed (for M2/M4 policies)
+        if args_cli.force_sensing:
+            try:
+                from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.force_sensor_env_wrapper import (
+                    VecEnvForceSensorWrapper,
+                    ForceSensorConfig,
+                )
+                force_cfg = ForceSensorConfig(
+                    enabled=True,
+                    force_obs_mode=args_cli.force_mode,
+                    normalize=True,
+                    effort_limit=70.0,
+                    robot_name="robot",
+                    object_name="cube_2",
+                    ee_frame_name="ee_frame",
+                )
+                env = VecEnvForceSensorWrapper(env, force_cfg)
+                print(f"  Force sensing enabled: mode={args_cli.force_mode}")
+            except Exception as e:
+                print(f"[ERROR] Failed to add force sensor wrapper: {e}")
+                raise
+        
+        # Wrap for RSL-RL
+        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        
+        # Load policy ONCE
+        print("Loading policy (one-time for all variants)...", flush=True)
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(resume_path)
+        
+        policy = runner.get_inference_policy(device=device)
+        try:
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            policy_nn = runner.alg.actor_critic
+        
+        # Run Variant 1 (Phase-based)
+        if args_cli.eval_variant in ["1", "both"]:
+            summary, results = run_variant1_eval_shared(
+                env=env,
+                policy=policy,
+                policy_nn=policy_nn,
+                policy_name=policy_name,
+                phases=phases,
+                durations=durations,
+                num_episodes=args_cli.eval_episodes,
+                device=device,
+                seed=agent_cfg.seed,
+            )
+            save_eval_results(args_cli.eval_output_dir, summary, results)
+            all_summaries.append(summary)
+        
+        # Run Variant 2 (Time-based)
+        if args_cli.eval_variant in ["2", "both"]:
+            summary, results = run_variant2_eval_shared(
+                env=env,
+                policy=policy,
+                policy_nn=policy_nn,
+                policy_name=policy_name,
+                onset_steps=onset_steps,
+                durations=durations,
+                num_episodes=args_cli.eval_episodes,
+                device=device,
+                seed=agent_cfg.seed,
+            )
+            save_eval_results(args_cli.eval_output_dir, summary, results)
+            all_summaries.append(summary)
+        
+        # Close environment
+        env.close()
+        
+        # Save combined summary
+        combined_path = os.path.join(args_cli.eval_output_dir, f"{policy_name}_all_summaries.json")
+        with open(combined_path, 'w') as f:
+            json.dump([asdict(s) for s in all_summaries], f, indent=2)
+        
+        print("\n" + "=" * 70)
+        print("EVALUATION COMPLETE")
+        print(f"Results saved to: {args_cli.eval_output_dir}")
+        print("=" * 70)
+        
+        return  # Exit after evaluation
+    
+    # =========================================================================
+    # NORMAL PLAY MODE
+    # =========================================================================
+    
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 

@@ -1086,6 +1086,23 @@ def goal_position(
     return goal.unsqueeze(0).expand(env.num_envs, -1)
 
 
+def target_cube_position(
+    env: "ManagerBasedRLEnv",
+    object_name: str = "cube_2",
+) -> torch.Tensor:
+    """Return the target cube position as an observation (env frame).
+
+    NOTE:
+    - This is *privileged* simulator state unless you interpret it as an oracle perception output
+      (i.e., the output of a pose estimator / tracker).
+    - `poe3.pdf` explicitly uses this framing to study robustness to perception outages by corrupting
+      the pose estimate (dropout/freeze/delay/noise), rather than corrupting raw pixels.
+    """
+    obj: RigidObject = env.scene[object_name]
+    pos = obj.data.root_pos_w - env.scene.env_origins
+    return pos
+
+
 def ee_to_goal_vector(
     env: "ManagerBasedRLEnv",
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),

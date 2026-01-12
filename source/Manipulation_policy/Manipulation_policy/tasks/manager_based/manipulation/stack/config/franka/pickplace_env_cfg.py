@@ -122,7 +122,23 @@ class ObservationsCfg:
 
     @configclass
     class ProprioCfg(ObsGroup):
-        """Proprioceptive observations (concatenated vector)."""
+        """Proprioceptive observations (concatenated vector).
+
+        Observation design options:
+        - If you want end-to-end vision robustness (poe2.pdf), DO NOT include cube pose here.
+        - For the `poe3.pdf` plan, we explicitly include the (oracle) cube position as a proxy for a
+          perception module output, and we study robustness by corrupting this pose estimate with a
+          dedicated wrapper (dropout/freeze/delay/noise+drift).
+
+        This file is currently configured for the `poe3.pdf` plan:
+        - Goal position is provided as a command input (realistic).
+        - Cube position is provided as an oracle pose estimate (privileged / perception output).
+
+        Note:
+        - Rewards/terminations can still use privileged state internally (standard).
+        - Force sensing (if enabled) is appended via `VecEnvForceSensorWrapper` and does not affect
+          the pose corruption wrapper (we corrupt before force append).
+        """
 
         actions = ObsTerm(func=mdp.last_action)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -131,19 +147,11 @@ class ObservationsCfg:
         eef_quat = ObsTerm(func=mdp.ee_frame_quat)
         gripper_pos = ObsTerm(func=mdp.gripper_pos)
         gripper_open_frac = ObsTerm(func=mdp.gripper_open_fraction, params={"robot_name": "robot"})
-        object = ObsTerm(func=mdp.object_obs)
-        # Target cube velocities improve stability and help credit assignment for place/release.
-        cube2_lin_ang_vel = ObsTerm(func=mdp.target_cube_lin_ang_vel, params={"object_name": "cube_2"})
-
-        # Goal information
+        # Task command (realistic): the goal position is provided by the task, not inferred from sensors.
         goal_position = ObsTerm(func=mdp.goal_position, params={"goal_pos": GOAL_POS})
-        cube_to_goal = ObsTerm(func=mdp.cube_to_goal_vector, params={"object_name": "cube_2", "goal_pos": GOAL_POS})
-        cube_to_goal_dist = ObsTerm(func=mdp.cube_to_goal_distance_xy, params={"object_name": "cube_2", "goal_pos": GOAL_POS})
-        cube_height = ObsTerm(func=mdp.target_cube_height_above_table, params={"object_name": "cube_2", "table_z": TABLE_Z})
-        cube_in_goal_xy = ObsTerm(
-            func=mdp.cube_in_goal_region,
-            params={"object_name": "cube_2", "goal_pos": GOAL_POS, "goal_half_extents_xy": GOAL_HALF_EXTENTS_XY},
-        )
+        # Oracle perception output (privileged): cube position in env frame.
+        # `PoseCorruptionEnvWrapper` can corrupt this signal to simulate perception outages.
+        cube_position = ObsTerm(func=mdp.target_cube_position, params={"object_name": "cube_2"})
 
         def __post_init__(self):
             self.enable_corruption = False

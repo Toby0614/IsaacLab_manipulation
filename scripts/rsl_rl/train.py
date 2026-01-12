@@ -69,6 +69,26 @@ parser.add_argument(
 parser.add_argument("--dropout_prob", type=float, default=None, help="Dropout probability per step")
 parser.add_argument("--dropout_duration_min", type=int, default=None, help="Min dropout duration (steps)")
 parser.add_argument("--dropout_duration_max", type=int, default=None, help="Max dropout duration (steps)")
+# pose corruption (oracle pose estimate) arguments - poe3.pdf plan
+parser.add_argument(
+    "--pose_corruption",
+    action="store_true",
+    default=False,
+    help="Enable pose corruption wrapper on oracle cube_position observation (poe3.pdf plan).",
+)
+parser.add_argument(
+    "--pose_corruption_mode",
+    type=str,
+    default="freeze",
+    choices=["hard", "freeze", "delay", "noise", "mixed"],
+    help="Pose corruption mode: hard (zero), freeze (stale), delay (k-step lag), noise, mixed.",
+)
+parser.add_argument("--pose_corruption_prob", type=float, default=0.02, help="Pose corruption event start probability per step")
+parser.add_argument("--pose_corruption_duration_min", type=int, default=5, help="Min pose corruption duration (steps)")
+parser.add_argument("--pose_corruption_duration_max", type=int, default=40, help="Max pose corruption duration (steps)")
+parser.add_argument("--pose_corruption_delay_steps", type=int, default=5, help="Delay steps for pose_corruption_mode=delay")
+parser.add_argument("--pose_corruption_noise_std", type=float, default=0.01, help="Gaussian noise std for pose corruption (meters)")
+parser.add_argument("--pose_corruption_drift_noise_std", type=float, default=0.001, help="Drift noise std for pose corruption (meters)")
 # force sensing arguments
 parser.add_argument(
     "--force_sensing", action="store_true", default=False,
@@ -352,6 +372,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         except Exception as e:
             print(f"[ERROR] Failed to initialize dropout wrapper: {e}")
             print("[WARNING] Continuing without dropout (M1 mode)")
+            import traceback
+            traceback.print_exc()
+
+    # wrap for pose corruption (oracle pose estimate outages) - poe3.pdf plan
+    if args_cli.pose_corruption:
+        try:
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.pose_corruption_cfg import PoseCorruptionCfg
+            from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.pose_corruption_env_wrapper import (
+                VecEnvPoseCorruptionWrapper,
+            )
+
+            pose_cfg = PoseCorruptionCfg(
+                enabled=True,
+                mode=args_cli.pose_corruption_mode,
+                event_probability=float(args_cli.pose_corruption_prob),
+                duration_range=(int(args_cli.pose_corruption_duration_min), int(args_cli.pose_corruption_duration_max)),
+                delay_steps=int(args_cli.pose_corruption_delay_steps),
+                noise_std=float(args_cli.pose_corruption_noise_std),
+                drift_noise_std=float(args_cli.pose_corruption_drift_noise_std),
+            )
+
+            # IMPORTANT: apply BEFORE force wrapper, so cube_position is still the last 3 dims of base proprio.
+            env = VecEnvPoseCorruptionWrapper(env, pose_cfg)
+
+            print("=" * 80)
+            print("[INFO] Pose Corruption ENABLED (oracle cube_position outage simulation):")
+            print(f"  Mode: {pose_cfg.mode}")
+            print(f"  Probability: {pose_cfg.event_probability:.3f}")
+            print(f"  Duration range: {pose_cfg.duration_range} steps")
+            if pose_cfg.mode == "delay":
+                print(f"  Delay steps: {pose_cfg.delay_steps}")
+            if pose_cfg.mode in ("noise", "mixed"):
+                print(f"  Noise std: {pose_cfg.noise_std} m")
+                print(f"  Drift noise std: {pose_cfg.drift_noise_std} m")
+            print("=" * 80)
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize pose corruption wrapper: {e}")
+            print("[WARNING] Continuing without pose corruption")
             import traceback
             traceback.print_exc()
 
