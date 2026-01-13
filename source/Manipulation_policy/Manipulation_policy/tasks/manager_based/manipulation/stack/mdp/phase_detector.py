@@ -53,10 +53,19 @@ class PickPlacePhaseDetector:
         # If you change the task goal, pass it explicitly when constructing this detector.
         goal_pos: tuple[float, float, float] = (0.21, 0.28, 0.0203),
         table_z: float = 0.0203,
-        lift_threshold: float = 0.05,
+        # Align with the task success threshold (pickplace_env_cfg.py uses lift_height_thresh=0.03).
+        lift_threshold: float = 0.03,
         grasp_dist_threshold: float = 0.06,
-        goal_xy_radius: float = 0.10,
-        transport_height_min: float = 0.04,
+        # Goal region half extents are 0.05m; use a slightly larger radius for robustness.
+        goal_xy_radius: float = 0.08,
+        # IMPORTANT:
+        # `transport_height_min` must be > `lift_threshold`, otherwise the detector will *never*
+        # output the "lift" phase because the logic checks `is_lifted and in_transport_height`
+        # before checking `is_lifted`.
+        #
+        # This directly affects phase-triggered corruption evaluation (poe3.pdf):
+        # if "lift" is unreachable, your "lift × duration" grid will show 0% corruption triggered.
+        transport_height_min: float = 0.05,
     ):
         """Initialize phase detector.
         
@@ -128,7 +137,9 @@ class PickPlacePhaseDetector:
             at_goal_xy = obj_to_goal_xy[i] < self.goal_xy_radius
             in_transport_height = obj_height[i] > self.transport_height_min
             
-            if at_goal_xy and is_lifted:
+            # Place/release happens near the goal while lowering and/or releasing, so do NOT require "lifted".
+            # This is intentionally a loose phase indicator for scheduling evaluation corruptions.
+            if at_goal_xy:
                 phase = "place"
             elif is_lifted and in_transport_height:
                 phase = "transport"

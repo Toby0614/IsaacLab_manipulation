@@ -196,6 +196,10 @@ def _sanitize_hydra_overrides(overrides: list[str]) -> list[str]:
         s = str(a)
         if s.strip() == "":
             continue
+        # Strip bash-style comment tokens that sometimes sneak into multi-line scripts.
+        # Hydra override grammar cannot parse a raw '#' token.
+        if s.lstrip().startswith("#"):
+            continue
         if s.strip("\\").strip() == "":
             continue
         sanitized.append(s)
@@ -259,6 +263,9 @@ class EvalResult:
     std_episode_length: float
     num_episodes: int
     dropout_triggered_rate: float
+    # Pose-corruption specific diagnostics (kept optional-ish via defaults so dropout eval doesn't break)
+    corruption_step_rate: float = 0.0
+    corruption_episode_rate: float = 0.0
 
 
 @dataclass
@@ -692,13 +699,19 @@ def _infer_force_dim(force_mode: str) -> int:
     return int(force_dims.get(force_mode, 0))
 
 
-def apply_pose_corruption_to_obs(obs, pose_manager, force_dim: int):
-    """Corrupt the cube_position slice in obs['proprio'].
+def apply_pose_corruption_to_obs(obs, pose_manager, force_dim: int, env_unwrapped=None):
+    """Corrupt the cube *world position* embedded inside obs['proprio'].
 
-    Assumptions (by construction in this repo):
-    - `cube_position` is 3 dims appended at the end of the *base* proprio vector.
-    - If a force wrapper is used, force dims are appended AFTER base proprio, so cube_position becomes
-      the slice [-force_dim-3 : -force_dim] (or the last 3 dims if force_dim==0).
+    IMPORTANT:
+    - The actual `proprio` vector for `Isaac-Franka-PickPlace-v0` is a concatenation of many ObsTerms
+      (see `.../config/franka/pickplace_env_cfg*.py`). The cube position is NOT guaranteed to be the
+      last 3 dims.
+    - Older code assumed "cube_position is at the end", which silently corrupted the wrong features
+      and produced misleading "Pose corrupted: 0%" diagnostics.
+
+    This function therefore supports two modes:
+    - If the unwrapped env exposes a cached `__pose_eval_cube_pos_indices`, we use it.
+    - Otherwise we fall back to the legacy "last 3 dims" heuristic (for older checkpoints/envs).
     """
     if obs is None:
         return obs
@@ -712,18 +725,71 @@ def apply_pose_corruption_to_obs(obs, pose_manager, force_dim: int):
     if proprio.shape[1] < (3 + max(force_dim, 0)):
         return obs
 
-    if force_dim > 0:
-        cube_slice = slice(-(force_dim + 3), -force_dim)
-    else:
-        cube_slice = slice(-3, None)
+    # NOTE: We infer indices lazily because `proprio` ordering depends on the env config and wrappers.
+    cube_indices = getattr(env_unwrapped, "__pose_eval_cube_pos_indices", None) if env_unwrapped is not None else None
 
-    cube_pos = proprio[:, cube_slice]
+    # Legacy fallback: assume cube pos is right before force dims (if any).
+    if cube_indices is None:
+        if force_dim > 0:
+            cube_slice = slice(-(force_dim + 3), -force_dim)
+        else:
+            cube_slice = slice(-3, None)
+        cube_pos = proprio[:, cube_slice]
+        cube_pos_corrupt = pose_manager.apply(cube_pos)
+        obs["proprio"] = (
+            torch.cat([proprio[:, : cube_slice.start], cube_pos_corrupt, proprio[:, cube_slice.stop :]], dim=1)
+            if force_dim > 0
+            else torch.cat([proprio[:, :-3], cube_pos_corrupt], dim=1)
+        )
+        return obs
+
+    # New robust path: overwrite the identified cube position columns (xyz).
+    idx = torch.as_tensor(cube_indices, device=proprio.device, dtype=torch.long)  # (3,)
+    cube_pos = proprio.index_select(dim=1, index=idx)  # (B,3)
     cube_pos_corrupt = pose_manager.apply(cube_pos)
+    proprio_out = proprio.clone()
+    proprio_out[:, idx] = cube_pos_corrupt
+    obs["proprio"] = proprio_out
+    return obs
 
-    obs_out = obs
-    # TensorDict supports item assignment like dict; dict too.
-    obs_out["proprio"] = torch.cat([proprio[:, : cube_slice.start], cube_pos_corrupt, proprio[:, cube_slice.stop :]], dim=1) if force_dim > 0 else torch.cat([proprio[:, :-3], cube_pos_corrupt], dim=1)
-    return obs_out
+
+def _infer_cube_pos_indices(env_unwrapped, proprio: torch.Tensor) -> list[int] | None:
+    """Infer which 3 columns in `proprio` correspond to the cube world position (x,y,z).
+
+    We do this by matching columns against the oracle cube position computed from the scene.
+    Returns a list of 3 column indices [ix, iy, iz], or None if not confidently identified.
+    """
+    try:
+        obj = env_unwrapped.scene["cube_2"]
+        cube_pos = obj.data.root_pos_w - env_unwrapped.scene.env_origins  # (B,3)
+        if not torch.is_tensor(cube_pos) or cube_pos.ndim != 2 or cube_pos.shape[1] != 3:
+            return None
+        if cube_pos.shape[0] != proprio.shape[0]:
+            return None
+
+        # Use a small subset for speed (matching is very sharp: exact float equality often holds).
+        b = int(min(64, proprio.shape[0]))
+        p = proprio[:b].float()
+        c = cube_pos[:b].float()
+
+        # Compute per-column mean absolute error vs each cube coordinate.
+        # err[d, j] = mean_i |p[i, j] - c[i, d]|
+        err = torch.empty((3, p.shape[1]), device=p.device, dtype=torch.float32)
+        for d in range(3):
+            err[d] = (p - c[:, d : d + 1]).abs().mean(dim=0)
+
+        # Pick best column per dimension and validate with a tolerance.
+        best = torch.argmin(err, dim=1)  # (3,)
+        best_err = err[torch.arange(3, device=p.device), best]
+
+        # Tolerance: positions are in meters; 1e-3 is 1mm (already strict).
+        if torch.any(best_err > 1e-3):
+            return None
+
+        idxs = [int(best[0].item()), int(best[1].item()), int(best[2].item())]
+        return idxs
+    except Exception:
+        return None
 
 
 def run_evaluation_episodes_pose_v1(
@@ -735,6 +801,7 @@ def run_evaluation_episodes_pose_v1(
     pose_manager,
     phase_detector,
     force_dim: int,
+    seed: int,
 ) -> dict:
     """Run evaluation episodes for pose corruption Variant 1 (phase-triggered)."""
     num_envs = env.unwrapped.num_envs
@@ -742,7 +809,25 @@ def run_evaluation_episodes_pose_v1(
     successes = []
     episode_lengths = []
     triggered = []
+    corrupted_step_rates = []
 
+    # -------------------------------------------------------------------------
+    # IMPORTANT (speed + correctness with large num_envs):
+    #
+    # When num_envs >> num_episodes, collecting the *first* N completed episodes is biased toward
+    # "fast finishers". For faster evaluation with many envs (e.g., 1600), we instead:
+    # - sample a fixed random subset of env_ids of size `num_episodes`
+    # - collect exactly ONE episode from each sampled env
+    # This removes completion-time bias while still benefiting from parallel simulation throughput.
+    # -------------------------------------------------------------------------
+    target_env_count = int(min(num_episodes, num_envs))
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed) + 1337)
+    perm = torch.randperm(num_envs, generator=gen)
+    target_env_ids = perm[:target_env_count].to(device=device, dtype=torch.long)
+    is_target_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    is_target_env[target_env_ids] = True
+    collected_for_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
     episodes_completed = 0
 
     all_env_ids = torch.arange(num_envs, device=device)
@@ -750,6 +835,7 @@ def run_evaluation_episodes_pose_v1(
 
     obs = env.get_observations()
     env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    env_corrupted_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
     while episodes_completed < num_episodes:
         with torch.inference_mode():
@@ -761,7 +847,22 @@ def run_evaluation_episodes_pose_v1(
                 pass
             pose_manager.step()
 
-            obs_corrupt = apply_pose_corruption_to_obs(obs, pose_manager, force_dim=force_dim)
+            # Count timestep-level corruption (before action; corresponds to corrupted observation this step).
+            env_corrupted_steps += pose_manager.event_active.to(dtype=torch.int32)
+
+            # Lazily infer and cache cube-pos indices (once per env) for correct corruption.
+            if not hasattr(env.unwrapped, "__pose_eval_cube_pos_indices"):
+                inferred = None
+                if hasattr(obs, "keys") and "proprio" in obs and torch.is_tensor(obs["proprio"]) and obs["proprio"].ndim == 2:
+                    inferred = _infer_cube_pos_indices(env.unwrapped, obs["proprio"])
+                if inferred is not None:
+                    setattr(env.unwrapped, "__pose_eval_cube_pos_indices", inferred)
+                    print(f"  [INFO] pose-eval: inferred cube_position indices in obs['proprio']: {inferred}", flush=True)
+                else:
+                    setattr(env.unwrapped, "__pose_eval_cube_pos_indices", None)
+                    print("  [WARN] pose-eval: could not infer cube_position indices; falling back to legacy slice.", flush=True)
+
+            obs_corrupt = apply_pose_corruption_to_obs(obs, pose_manager, force_dim=force_dim, env_unwrapped=env.unwrapped)
             actions = policy(obs_corrupt)
             step_out = env.step(actions)
 
@@ -782,8 +883,12 @@ def run_evaluation_episodes_pose_v1(
             done_indices = done.nonzero(as_tuple=False).squeeze(-1)
 
             for idx in done_indices.cpu().tolist():
-                if episodes_completed >= num_episodes:
+                if episodes_completed >= target_env_count:
                     break
+                if not bool(is_target_env[idx].item()):
+                    continue
+                if bool(collected_for_env[idx].item()):
+                    continue
 
                 # success via termination_manager term (task success)
                 success = False
@@ -798,11 +903,18 @@ def run_evaluation_episodes_pose_v1(
 
                 successes.append(float(success))
                 episode_lengths.append(env_episode_step[idx].item())
-                triggered.append(float(pose_manager.triggered_count[idx].item() > 0))
+                did_trigger = float(pose_manager.triggered_count[idx].item() > 0)
+                triggered.append(did_trigger)
+                # timestep-level corruption fraction for this episode
+                ep_steps = max(int(env_episode_step[idx].item()), 1)
+                ep_corr = int(env_corrupted_steps[idx].item())
+                corrupted_step_rates.append(float(ep_corr / ep_steps))
+                collected_for_env[idx] = True
                 episodes_completed += 1
 
             if len(done_indices) > 0:
                 env_episode_step[done_indices] = 0
+                env_corrupted_steps[done_indices] = 0
                 pose_manager.reset(done_indices)
 
             policy_nn.reset(done)
@@ -811,8 +923,12 @@ def run_evaluation_episodes_pose_v1(
         "success_rate": np.mean(successes) if successes else 0.0,
         "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
         "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
-        "num_episodes": len(successes),
-        "dropout_triggered_rate": np.mean(triggered) if triggered else 0.0,
+        "num_episodes": int(episodes_completed),
+        # Keep original key for backward compatibility with your printing/saving pipeline,
+        # but interpret it as "timestep-level corruption rate" for poe3 evaluation.
+        "dropout_triggered_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
+        "corruption_step_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
+        "corruption_episode_rate": np.mean(triggered) if triggered else 0.0,
     }
 
 
@@ -824,6 +940,7 @@ def run_evaluation_episodes_pose_v2(
     device: str,
     pose_manager,
     force_dim: int,
+    seed: int,
 ) -> dict:
     """Run evaluation episodes for pose corruption Variant 2 (time-triggered)."""
     num_envs = env.unwrapped.num_envs
@@ -831,18 +948,44 @@ def run_evaluation_episodes_pose_v2(
     successes = []
     episode_lengths = []
     triggered = []
+    corrupted_step_rates = []
 
+    target_env_count = int(min(num_episodes, num_envs))
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed) + 7331)
+    perm = torch.randperm(num_envs, generator=gen)
+    target_env_ids = perm[:target_env_count].to(device=device, dtype=torch.long)
+    is_target_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    is_target_env[target_env_ids] = True
+    collected_for_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
     episodes_completed = 0
     all_env_ids = torch.arange(num_envs, device=device)
     pose_manager.reset(all_env_ids)
 
     obs = env.get_observations()
     env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    env_corrupted_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
     while episodes_completed < num_episodes:
         with torch.inference_mode():
             pose_manager.step()
-            obs_corrupt = apply_pose_corruption_to_obs(obs, pose_manager, force_dim=force_dim)
+
+            # Count timestep-level corruption (before action; corresponds to corrupted observation this step).
+            env_corrupted_steps += pose_manager.event_active.to(dtype=torch.int32)
+
+            # Lazily infer and cache cube-pos indices (once per env) for correct corruption.
+            if not hasattr(env.unwrapped, "__pose_eval_cube_pos_indices"):
+                inferred = None
+                if hasattr(obs, "keys") and "proprio" in obs and torch.is_tensor(obs["proprio"]) and obs["proprio"].ndim == 2:
+                    inferred = _infer_cube_pos_indices(env.unwrapped, obs["proprio"])
+                if inferred is not None:
+                    setattr(env.unwrapped, "__pose_eval_cube_pos_indices", inferred)
+                    print(f"  [INFO] pose-eval: inferred cube_position indices in obs['proprio']: {inferred}", flush=True)
+                else:
+                    setattr(env.unwrapped, "__pose_eval_cube_pos_indices", None)
+                    print("  [WARN] pose-eval: could not infer cube_position indices; falling back to legacy slice.", flush=True)
+
+            obs_corrupt = apply_pose_corruption_to_obs(obs, pose_manager, force_dim=force_dim, env_unwrapped=env.unwrapped)
             actions = policy(obs_corrupt)
             step_out = env.step(actions)
 
@@ -863,8 +1006,12 @@ def run_evaluation_episodes_pose_v2(
             done_indices = done.nonzero(as_tuple=False).squeeze(-1)
 
             for idx in done_indices.cpu().tolist():
-                if episodes_completed >= num_episodes:
+                if episodes_completed >= target_env_count:
                     break
+                if not bool(is_target_env[idx].item()):
+                    continue
+                if bool(collected_for_env[idx].item()):
+                    continue
 
                 success = False
                 try:
@@ -878,11 +1025,17 @@ def run_evaluation_episodes_pose_v2(
 
                 successes.append(float(success))
                 episode_lengths.append(env_episode_step[idx].item())
-                triggered.append(float(pose_manager.triggered_count[idx].item() > 0))
+                did_trigger = float(pose_manager.triggered_count[idx].item() > 0)
+                triggered.append(did_trigger)
+                ep_steps = max(int(env_episode_step[idx].item()), 1)
+                ep_corr = int(env_corrupted_steps[idx].item())
+                corrupted_step_rates.append(float(ep_corr / ep_steps))
+                collected_for_env[idx] = True
                 episodes_completed += 1
 
             if len(done_indices) > 0:
                 env_episode_step[done_indices] = 0
+                env_corrupted_steps[done_indices] = 0
                 pose_manager.reset(done_indices)
 
             policy_nn.reset(done)
@@ -891,8 +1044,10 @@ def run_evaluation_episodes_pose_v2(
         "success_rate": np.mean(successes) if successes else 0.0,
         "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
         "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
-        "num_episodes": len(successes),
-        "dropout_triggered_rate": np.mean(triggered) if triggered else 0.0,
+        "num_episodes": int(episodes_completed),
+        "dropout_triggered_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
+        "corruption_step_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
+        "corruption_episode_rate": np.mean(triggered) if triggered else 0.0,
     }
 
 
@@ -1033,8 +1188,9 @@ def run_pose_variant1_eval_shared(
                     target_phase=phase,
                     duration_steps=int(duration),
                     trigger_once_per_episode=True,
-                    require_stable_phase=True,
-                    stable_phase_steps=3,
+                    # poe3 intent: trigger immediately upon entering the phase (do NOT miss short/noisy phases)
+                    require_stable_phase=False,
+                    stable_phase_steps=0,
                     phase_entry_delay=0,
                     num_envs=env.unwrapped.num_envs,
                     device=device,
@@ -1043,7 +1199,7 @@ def run_pose_variant1_eval_shared(
 
                 metrics = run_evaluation_episodes_pose_v1(
                     env, policy, policy_nn, num_episodes, device,
-                    pose_manager, phase_detector, force_dim=force_dim
+                    pose_manager, phase_detector, force_dim=force_dim, seed=seed
                 )
 
                 result = EvalResult(
@@ -1055,7 +1211,12 @@ def run_pose_variant1_eval_shared(
                 )
                 results.append(result)
                 phase_results.append(metrics["success_rate"])
-                print(f"Success: {metrics['success_rate']:.1%}, Pose corrupted: {metrics['dropout_triggered_rate']:.1%}")
+                # Pose corrupted is timestep-level rate (matches duration sweep intuition); also show episode trigger rate.
+                print(
+                    f"Success: {metrics['success_rate']:.1%}, "
+                    f"Pose corrupted (steps): {metrics['corruption_step_rate']:.1%}, "
+                    f"Pose triggered (episodes): {metrics['corruption_episode_rate']:.1%}"
+                )
 
             success_matrix.append(phase_results)
 
@@ -1133,7 +1294,7 @@ def run_pose_variant2_eval_shared(
 
                 metrics = run_evaluation_episodes_pose_v2(
                     env, policy, policy_nn, num_episodes, device,
-                    pose_manager, force_dim=force_dim
+                    pose_manager, force_dim=force_dim, seed=seed
                 )
 
                 result = EvalResult(
@@ -1145,7 +1306,11 @@ def run_pose_variant2_eval_shared(
                 )
                 results.append(result)
                 onset_results.append(metrics["success_rate"])
-                print(f"Success: {metrics['success_rate']:.1%}, Pose corrupted: {metrics['dropout_triggered_rate']:.1%}")
+                print(
+                    f"Success: {metrics['success_rate']:.1%}, "
+                    f"Pose corrupted (steps): {metrics['corruption_step_rate']:.1%}, "
+                    f"Pose triggered (episodes): {metrics['corruption_episode_rate']:.1%}"
+                )
 
             success_matrix.append(onset_results)
 
@@ -1406,6 +1571,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         all_summaries = []
 
         # Create environment ONCE
+        #
+        # NOTE: We allow large `num_envs` for speed. To avoid evaluation bias when `num_envs` is much larger
+        # than `pose_eval_episodes`, the episode collector samples a fixed random subset of env_ids and collects
+        # one episode per sampled env (unbiased wrt completion time).
+        requested_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+        env_cfg.scene.num_envs = int(requested_envs)
+        if int(requested_envs) > int(args_cli.pose_eval_episodes):
+            print(
+                f"[INFO] pose-eval: num_envs={requested_envs} > pose_eval_episodes={args_cli.pose_eval_episodes}; "
+                f"using random env-subset sampling (one episode per sampled env) for unbiased fast eval."
+            )
+
         print("\nCreating environment (one-time for pose eval)...", flush=True)
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
         if isinstance(env.unwrapped, DirectMARLEnv):

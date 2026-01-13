@@ -26,8 +26,8 @@ mkdir -p "${OUT_DIR}"
 # -----------------------------------------------------------------------------
 POLICY_BASE="/home/toby0614/IsaacLab/Projects/Manipulation_policy/logs/rsl_rl/franka_pickplace"
 
-M1_CKPT="${POLICY_BASE}/M1_policy/model_1000.pt"
-M2_CKPT="${POLICY_BASE}/M2_policy/model_1500.pt"
+M1_CKPT="${POLICY_BASE}/M1_new/model_2000.pt"
+M2_CKPT="${POLICY_BASE}/M2_new/model_1000.pt"
 M3_CKPT="${POLICY_BASE}/M3_pose/model_1500.pt"
 M4_CKPT="${POLICY_BASE}/M4_pose/model_1500.pt"
 
@@ -41,10 +41,17 @@ done
 # -----------------------------------------------------------------------------
 # Shared pose evaluation args
 # -----------------------------------------------------------------------------
+#
+# NOTE: episode length is ~84 policy steps (7s with dt=0.0167, decimation=5),
+# so onset steps must be <= ~80 to reliably trigger.
+  # Time-based variant uses POLICY steps (not sim substeps). With dt=0.0167 and decimation=5,
+  # one policy step ≈ 0.083s (~12 Hz). If many episodes finish in 1–3s, use onsets within ~0–36 steps.
+  # Note: onset=0 will not trigger (episode_step_count increments to 1 on first step), so start at 1.
+#
 POSE_EVAL_ARGS="--eval_pose_corruption \
   --pose_eval_variant both \
   --pose_eval_phases reach,grasp,lift,transport,place \
-  --pose_eval_onset_steps 10,25,50,75,100,125,150 \
+  --pose_eval_onset_steps 1,5,10,15,20,25,30,35 \
   --pose_eval_durations 5,10,20,40,80 \
   --pose_eval_modes hard,freeze,noise,delay \
   --pose_eval_episodes 200 \
@@ -52,7 +59,7 @@ POSE_EVAL_ARGS="--eval_pose_corruption \
   --pose_eval_delay_steps 5 \
   --pose_eval_noise_std 0.01 \
   --pose_eval_drift_noise_std 0.001 \
-  --num_envs 1600 \
+  --num_envs 800 \
   --headless \
   --enable_cameras"
 

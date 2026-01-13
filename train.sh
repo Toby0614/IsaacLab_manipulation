@@ -49,10 +49,6 @@ python scripts/rsl_rl/train.py \
   --force_sensing \
   --force_mode grasp_indicator
 
-  # Evaluation
-  ./run_overnight_eval.sh
-
-
 # M3_pose train
 python scripts/rsl_rl/train.py \
   --task Isaac-Franka-PickPlace-v0 \
@@ -70,6 +66,12 @@ python scripts/rsl_rl/train.py \
   --headless \
   --enable_cameras \
   --force_sensing \
-  --force_mode grasp_indicator \ #force sensing wrapper
+  --force_mode grasp_indicator \
   --pose_corruption \
   --pose_corruption_mode mixed
+
+  # checkpoint
+  tensorboard --logdir logs/rsl_rl/franka_pickplace/M2_new
+
+# Evaluation
+bash run_pose_eval_all.sh

@@ -72,13 +72,52 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
             if not torch.is_tensor(proprio) or proprio.ndim != 2 or proprio.shape[1] < 3:
                 return obs
 
-            # Assumption by design: `cube_position` is appended at the END of the base proprio vector.
-            # This wrapper is intended to be applied BEFORE the force wrapper (which appends to proprio),
-            # so the last 3 dims correspond to cube_position at this stage.
-            cube_pos = proprio[:, -3:]
+            # Robustly find which columns correspond to the cube world position (x,y,z).
+            # The observation config concatenates many terms; cube position is NOT guaranteed to be last.
+            base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+
+            idxs = getattr(base_env, "__pose_corruption_cube_pos_indices", None)
+            if idxs is None:
+                try:
+                    obj = base_env.scene["cube_2"]
+                    cube_pos_oracle = obj.data.root_pos_w - base_env.scene.env_origins  # (B,3)
+                    # Use small batch subset for matching (fast + stable).
+                    b = int(min(64, proprio.shape[0]))
+                    p = proprio[:b].float()
+                    c = cube_pos_oracle[:b].float()
+
+                    err = torch.empty((3, p.shape[1]), device=p.device, dtype=torch.float32)
+                    for d in range(3):
+                        err[d] = (p - c[:, d : d + 1]).abs().mean(dim=0)
+                    best = torch.argmin(err, dim=1)
+                    best_err = err[torch.arange(3, device=p.device), best]
+
+                    if torch.any(best_err > 1e-3):
+                        idxs = None
+                    else:
+                        idxs = [int(best[0].item()), int(best[1].item()), int(best[2].item())]
+                except Exception:
+                    idxs = None
+
+                setattr(base_env, "__pose_corruption_cube_pos_indices", idxs)
+
+            if idxs is None:
+                # Fallback for older envs/checkpoints.
+                cube_pos = proprio[:, -3:]
+                write_mode = "slice"
+            else:
+                idx = torch.as_tensor(idxs, device=proprio.device, dtype=torch.long)
+                cube_pos = proprio.index_select(dim=1, index=idx)
+                write_mode = "indices"
+
             self.manager.step()
             cube_pos_corrupt = self.manager.apply(cube_pos)
-            obs["proprio"] = torch.cat([proprio[:, :-3], cube_pos_corrupt], dim=1)
+            if write_mode == "slice":
+                obs["proprio"] = torch.cat([proprio[:, :-3], cube_pos_corrupt], dim=1)
+            else:
+                proprio_out = proprio.clone()
+                proprio_out[:, idx] = cube_pos_corrupt
+                obs["proprio"] = proprio_out
             return obs
 
         return obs
