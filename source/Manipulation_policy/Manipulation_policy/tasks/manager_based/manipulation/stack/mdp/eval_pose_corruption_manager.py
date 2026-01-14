@@ -94,6 +94,7 @@ class PhaseTriggeredPoseCorruptionManager(PoseCorruptionManager):
             # Trigger deterministic event
             self.event_active[i] = True
             self.remaining_steps[i] = int(self.duration_steps)
+            self.event_just_started[i] = True
             self.triggered_this_episode[i] = True
             self.triggered_count[i] += 1
             self._drift_bias[i] = 0.0
@@ -137,6 +138,7 @@ class TimeTriggeredPoseCorruptionManager(PoseCorruptionManager):
         if should_trigger.any():
             self.event_active[should_trigger] = True
             self.remaining_steps[should_trigger] = int(self.duration_steps)
+            self.event_just_started[should_trigger] = True
             self.triggered_this_episode[should_trigger] = True
             self.triggered_count[should_trigger] += 1
             self._drift_bias[should_trigger] = 0.0

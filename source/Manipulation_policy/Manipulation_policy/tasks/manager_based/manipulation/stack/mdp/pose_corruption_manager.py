@@ -22,6 +22,8 @@ class PoseCorruptionManager:
         self.event_active = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
         self.remaining_steps = torch.zeros(self.num_envs, dtype=torch.int32, device=device)
         self.episode_step_count = torch.zeros(self.num_envs, dtype=torch.int32, device=device)
+        # True for envs where an event started on the *current* step (used for correct freeze snapshot).
+        self.event_just_started = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
 
         # For freeze/delay
         self.last_valid_pose = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=device)
@@ -50,6 +52,7 @@ class PoseCorruptionManager:
         self.event_active[env_ids] = False
         self.remaining_steps[env_ids] = 0
         self.episode_step_count[env_ids] = 0
+        self.event_just_started[env_ids] = False
         self.triggered_count[env_ids] = 0
         self.last_valid_pose[env_ids] = 0.0
         self._drift_bias[env_ids] = 0.0
@@ -63,6 +66,9 @@ class PoseCorruptionManager:
         if not self.cfg.enabled:
             self.episode_step_count += 1
             return
+
+        # Clear one-step pulse.
+        self.event_just_started[:] = False
 
         self.episode_step_count += 1
 
@@ -87,6 +93,7 @@ class PoseCorruptionManager:
                 dur = torch.randint(low=dmin, high=dmax + 1, size=(self.num_envs,), device=self.device, dtype=torch.int32)
                 self.event_active[start_mask] = True
                 self.remaining_steps[start_mask] = dur[start_mask]
+                self.event_just_started[start_mask] = True
                 self.triggered_count[start_mask] += 1
 
                 # Reset drift bias at event start (optional but stable)
@@ -113,17 +120,31 @@ class PoseCorruptionManager:
 
         Assumes `pose` is in env frame and float-like.
         """
-        if not self.cfg.enabled or not self.event_active.any():
-            # Still update tracking/buffers for freeze/delay correctness
-            self._update_buffers(pose)
+        if not self.cfg.enabled:
             return pose
 
-        pose_f = pose.float()
-        self._update_buffers(pose_f)
+        # Choose per-env modes once for this step.
+        modes = self._choose_mode_per_env()
+
+        # Figure out which envs are currently in an active "freeze" event for THIS step.
+        # This is required so that "freeze" actually becomes stale for L steps:
+        # we must NOT keep updating last_valid_pose while a freeze event is active.
+        if self.cfg.mode == "freeze":
+            freeze_active = self.event_active.clone()
+        elif self.cfg.mode == "mixed":
+            freeze_active = torch.tensor([m == "freeze" for m in modes], device=self.device, dtype=torch.bool) & self.event_active
+        else:
+            freeze_active = torch.zeros_like(self.event_active, dtype=torch.bool)
+
+        pose_f = pose.float() if torch.is_tensor(pose) else pose
+        # Always update buffers, but do it in a way that preserves freeze semantics.
+        self._update_buffers(pose_f, freeze_active=freeze_active)
+
+        if not self.event_active.any():
+            return pose
 
         out = pose_f.clone()
         active = self.event_active
-        modes = self._choose_mode_per_env()
 
         # Drift update for active envs (only used by noise)
         if float(self.cfg.drift_noise_std) > 0.0:
@@ -152,12 +173,22 @@ class PoseCorruptionManager:
 
         return out.to(dtype=pose.dtype) if pose.dtype != torch.float32 else out
 
-    def _update_buffers(self, pose: torch.Tensor):
-        """Update last_valid_pose and delay ring buffer."""
-        # We treat input pose as the current (oracle) measurement.
-        self.last_valid_pose = pose.detach()
+    def _update_buffers(self, pose: torch.Tensor, *, freeze_active: torch.Tensor):
+        """Update last_valid_pose and delay ring buffer.
+
+        Correct freeze semantics:
+        - When a freeze event is active, the measurement output should be stale for L steps.
+          Therefore, we must NOT update `last_valid_pose` while (freeze_active == True),
+          except on the *first* step of the event (event_just_started) to snapshot the reading.
+        """
+        pose_d = pose.detach()
+        # Update last_valid_pose for envs that are NOT in an ongoing freeze,
+        # and also for envs whose freeze event just started (snapshot).
+        update_mask = (~freeze_active) | self.event_just_started
+        if update_mask.any():
+            self.last_valid_pose[update_mask] = pose_d[update_mask]
         if self._delay_buf is not None:
-            self._delay_buf[self._delay_idx, :, :] = pose.detach()
+            self._delay_buf[self._delay_idx, :, :] = pose_d
             self._delay_idx = (self._delay_idx + 1) % self._delay_buf.shape[0]
 
     def _get_delayed_pose(self, env_i: int) -> torch.Tensor:

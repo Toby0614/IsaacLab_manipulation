@@ -830,10 +830,26 @@ def run_evaluation_episodes_pose_v1(
     collected_for_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
     episodes_completed = 0
 
+    # Reset env at the start of EACH condition so "trigger on entering phase" is meaningful.
+    # This fixes the poe4.pdf issue where conditions could begin mid-episode.
+    try:
+        reset_out = env.reset()
+        if isinstance(reset_out, tuple) and len(reset_out) >= 1:
+            obs = reset_out[0]
+        else:
+            obs = reset_out
+    except Exception:
+        # Fallback: if env.reset() isn't supported by the wrapper stack, keep old behavior.
+        obs = env.get_observations()
+
+    # Reset recurrent states defensively.
+    try:
+        policy_nn.reset(torch.ones((num_envs,), device=device, dtype=torch.bool))
+    except Exception:
+        pass
+
     all_env_ids = torch.arange(num_envs, device=device)
     pose_manager.reset(all_env_ids)
-
-    obs = env.get_observations()
     env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
     env_corrupted_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
@@ -962,7 +978,20 @@ def run_evaluation_episodes_pose_v2(
     all_env_ids = torch.arange(num_envs, device=device)
     pose_manager.reset(all_env_ids)
 
-    obs = env.get_observations()
+    # Reset env at the start of EACH condition so onset steps are measured from episode start.
+    try:
+        reset_out = env.reset()
+        if isinstance(reset_out, tuple) and len(reset_out) >= 1:
+            obs = reset_out[0]
+        else:
+            obs = reset_out
+    except Exception:
+        obs = env.get_observations()
+
+    try:
+        policy_nn.reset(torch.ones((num_envs,), device=device, dtype=torch.bool))
+    except Exception:
+        pass
     env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
     env_corrupted_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 

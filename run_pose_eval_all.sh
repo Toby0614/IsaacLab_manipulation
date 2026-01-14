@@ -18,7 +18,7 @@ set -euo pipefail
 
 cd /home/toby0614/IsaacLab/Projects/Manipulation_policy
 
-OUT_DIR="results/pose_eval_all"
+OUT_DIR="results/pose_eval_final"
 mkdir -p "${OUT_DIR}"
 
 # -----------------------------------------------------------------------------
@@ -54,12 +54,12 @@ POSE_EVAL_ARGS="--eval_pose_corruption \
   --pose_eval_onset_steps 1,5,10,15,20,25,30,35 \
   --pose_eval_durations 5,10,20,40,80 \
   --pose_eval_modes hard,freeze,noise,delay \
-  --pose_eval_episodes 200 \
+  --pose_eval_episodes 500 \
   --pose_eval_output_dir ${OUT_DIR} \
   --pose_eval_delay_steps 5 \
   --pose_eval_noise_std 0.01 \
   --pose_eval_drift_noise_std 0.001 \
-  --num_envs 800 \
+  --num_envs 1200 \
   --headless \
   --enable_cameras"
 
