@@ -20,7 +20,6 @@ cd /home/toby0614/IsaacLab/Projects/Manipulation_policy
 
 OUT_DIR="results/pose_eval_final"
 mkdir -p "${OUT_DIR}"
-
 # -----------------------------------------------------------------------------
 # TODO: EDIT THESE FOUR PATHS TO POINT TO THE EXACT .pt FILES YOU WANT TO EVAL
 # -----------------------------------------------------------------------------
