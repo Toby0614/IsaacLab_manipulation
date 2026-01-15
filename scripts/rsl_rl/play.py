@@ -21,6 +21,12 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--no_policy",
+    action="store_true",
+    default=False,
+    help="Do not load/run a policy; step the env with zero actions (static demo).",
+)
+parser.add_argument(
     "--export_policy",
     action="store_true",
     default=False,
@@ -2191,8 +2197,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         normalizer = None
 
+    # Optionally disable policy and keep the robot static (zero actions).
+    if args_cli.no_policy:
+        print("[INFO] no_policy enabled: stepping env with zero actions.")
+        policy = None
+        policy_nn = None
+
     # export policy to onnx/jit (optional)
-    if args_cli.export_policy:
+    if args_cli.export_policy and policy_nn is not None:
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
         try:
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
@@ -2214,11 +2226,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            actions = policy(obs)
+            if policy is None:
+                act_shape = env.action_space.shape
+                if len(act_shape) == 1:
+                    act_shape = (env.unwrapped.num_envs, act_shape[0])
+                actions = torch.zeros(act_shape, device=env.unwrapped.device, dtype=torch.float32)
+            else:
+                actions = policy(obs)
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
-            policy_nn.reset(dones)
+            if policy_nn is not None:
+                policy_nn.reset(dones)
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

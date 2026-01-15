@@ -1,7 +1,3 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
 
 from dataclasses import MISSING
 
@@ -22,61 +18,42 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from . import mdp
 
 
-##
-# Scene definition
-##
 @configclass
 class ObjectTableSceneCfg(InteractiveSceneCfg):
-    """Configuration for the lift scene with a robot and a object.
-    This is the abstract base implementation, the exact scene is defined in the derived classes
-    which need to set the target object, robot and end-effector frames
-    """
 
-    # robots: will be populated by agent env cfg
     robot: ArticulationCfg = MISSING
-    # end-effector sensor: will be populated by agent env cfg
     ee_frame: FrameTransformerCfg = MISSING
 
-    # Table
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
         init_state=AssetBaseCfg.InitialStateCfg(pos=[0.5, 0, 0], rot=[0.707, 0, 0, 0.707]),
         spawn=UsdFileCfg(usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd"),
     )
 
-    # plane
     plane = AssetBaseCfg(
         prim_path="/World/GroundPlane",
         init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, -1.05]),
         spawn=GroundPlaneCfg(),
     )
 
-    # lights
     light = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
 
-##
-# MDP settings
-##
 @configclass
 class ActionsCfg:
-    """Action specifications for the MDP."""
 
-    # will be set by agent env cfg
     arm_action: mdp.JointPositionActionCfg = MISSING
     gripper_action: mdp.BinaryJointPositionActionCfg = MISSING
 
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP."""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group with state values."""
 
         actions = ObsTerm(func=mdp.last_action)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -94,7 +71,6 @@ class ObservationsCfg:
 
     @configclass
     class RGBCameraPolicyCfg(ObsGroup):
-        """Observations for policy group with RGB images."""
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -102,7 +78,6 @@ class ObservationsCfg:
 
     @configclass
     class SubtaskCfg(ObsGroup):
-        """Observations for subtask group."""
 
         grasp_1 = ObsTerm(
             func=mdp.object_grasped,
@@ -133,7 +108,6 @@ class ObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = False
 
-    # observation groups
     policy: PolicyCfg = PolicyCfg()
     rgb_camera: RGBCameraPolicyCfg = RGBCameraPolicyCfg()
     subtask_terms: SubtaskCfg = SubtaskCfg()
@@ -141,7 +115,6 @@ class ObservationsCfg:
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
@@ -162,38 +135,23 @@ class TerminationsCfg:
 
 @configclass
 class StackEnvCfg(ManagerBasedRLEnvCfg):
-    """Configuration for the stacking environment."""
 
-    # Scene settings
     scene: ObjectTableSceneCfg = ObjectTableSceneCfg(num_envs=4096, env_spacing=2.5, replicate_physics=False)
-    # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
-    # MDP settings
     terminations: TerminationsCfg = TerminationsCfg()
 
-    # Unused managers
     commands = None
     rewards = None
     events = None
     curriculum = None
 
-    # NOTE: Disable OpenXR configuration for training runs.
-    # Hydra config serialization can fail on internal lambda callables inside XR configs (e.g. "lambda headpose"),
-    # which prevents the environment config from loading. If you need XR teleop, re-enable this.
     xr: XrCfg | None = None
 
     def __post_init__(self):
-        """Post initialization."""
-        # general settings
         self.decimation = 5
         self.episode_length_s = 30.0
-        # simulation settings
-        # Physics at ~60Hz (was 100Hz).
         self.sim.dt = 0.0166667
-        # IMPORTANT: keep render_interval >= decimation when using cameras.
-        # If render_interval < decimation, IsaacLab warns and may render multiple times per env step.
-        # Rendering dominates performance with many envs + cameras, so avoid extra renders.
         self.sim.render_interval = self.decimation
 
         self.sim.physx.bounce_threshold_velocity = 0.2

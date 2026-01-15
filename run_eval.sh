@@ -1,18 +1,4 @@
 #!/bin/bash
-# =============================================================================
-# POSE CORRUPTION EVALUATION (poe3.pdf) - ALL POLICIES (M1-M4)
-# =============================================================================
-#
-# This script evaluates 4 policies under pose corruption (oracle cube_position outages):
-# - M1_policy: pose+proprio baseline
-# - M2_policy: pose+proprio+force
-# - M3_pose:   pose+proprio, trained with pose corruption
-# - M4_pose:   pose+proprio+force, trained with pose corruption
-#
-# You manually set the checkpoint .pt paths below (no auto "latest checkpoint").
-#
-# Results saved to: results/pose_eval_all/
-# =============================================================================
 
 set -euo pipefail
 
@@ -20,9 +6,6 @@ cd /home/toby0614/IsaacLab/Projects/Manipulation_policy
 
 OUT_DIR="results/pose_eval_final_fixed2"
 mkdir -p "${OUT_DIR}"
-# -----------------------------------------------------------------------------
-# TODO: EDIT THESE FOUR PATHS TO POINT TO THE EXACT .pt FILES YOU WANT TO EVAL
-# -----------------------------------------------------------------------------
 POLICY_BASE="/home/toby0614/IsaacLab/Projects/Manipulation_policy/logs/rsl_rl/franka_pickplace"
 
 M1_CKPT="${POLICY_BASE}/M1_new/model_2000.pt"
@@ -37,16 +20,6 @@ for ckpt in "$M1_CKPT" "$M2_CKPT" "$M3_CKPT" "$M4_CKPT"; do
   fi
 done
 
-# -----------------------------------------------------------------------------
-# Shared pose evaluation args
-# -----------------------------------------------------------------------------
-#
-# NOTE: episode length is ~84 policy steps (7s with dt=0.0167, decimation=5),
-# so onset steps must be <= ~80 to reliably trigger.
-  # Time-based variant uses POLICY steps (not sim substeps). With dt=0.0167 and decimation=5,
-  # one policy step ≈ 0.083s (~12 Hz). If many episodes finish in 1–3s, use onsets within ~0–36 steps.
-  # Note: onset=0 will not trigger (episode_step_count increments to 1 on first step), so start at 1.
-#
 POSE_EVAL_ARGS="--eval_pose_corruption \
   --pose_eval_variant both \
   --pose_eval_phases reach,grasp,lift,transport,place \

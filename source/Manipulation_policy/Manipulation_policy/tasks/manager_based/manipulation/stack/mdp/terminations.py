@@ -1,13 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
 
-"""Common functions that can be used to activate certain terminations for the lift task.
-
-The functions can be passed to the :class:`isaaclab.managers.TerminationTermCfg` object to enable
-the termination introduced by the function.
-"""
 
 from __future__ import annotations
 
@@ -21,7 +12,6 @@ from isaaclab.managers.manager_base import ManagerTermBase
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-# Local imports (kept at module scope for config serialization friendliness)
 from .observations import object_grasped
 
 
@@ -35,11 +25,9 @@ def object_in_goal_and_released(
     robot_name: str = "robot",
     open_thresh: float = 0.5,
 ) -> torch.Tensor:
-    """Success termination: object in goal XY, near table, gripper open."""
     obj: RigidObject = env.scene[object_cfg.name]
     pos = obj.data.root_pos_w - env.scene.env_origins
     
-    # XY in goal
     gx, gy = float(goal_pos[0]), float(goal_pos[1])
     hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
     in_xy = torch.logical_and(
@@ -47,11 +35,9 @@ def object_in_goal_and_released(
         torch.abs(pos[:, 1] - gy) <= hy
     )
     
-    # Height near table
     h = pos[:, 2] - float(table_z)
     height_ok = torch.abs(h) < float(place_height_tol)
     
-    # Gripper open
     open_frac = _gripper_open_fraction(env, robot_name=robot_name)
     opened = open_frac > float(open_thresh)
     
@@ -59,11 +45,6 @@ def object_in_goal_and_released(
 
 
 class PickPlaceSuccessWithLiftHistoryTerm(ManagerTermBase):
-    """Stateful termination that requires LIFT HISTORY before counting as success.
-    
-    This prevents the bug where pushing the cube into the goal counts as "success".
-    The robot must have actually grasped and lifted the object at some point.
-    """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -90,9 +71,7 @@ class PickPlaceSuccessWithLiftHistoryTerm(ManagerTermBase):
         lift_height_thresh: float = 0.03,
         open_thresh: float = 0.5,
     ) -> torch.Tensor:
-        """Returns True only if: ever_grasped AND ever_lifted AND in_goal AND height_ok AND gripper_open."""
         
-        # Update grasp/lift history
         grasped = object_grasped(
             env,
             robot_cfg=SceneEntityCfg(robot_name),
@@ -106,10 +85,8 @@ class PickPlaceSuccessWithLiftHistoryTerm(ManagerTermBase):
         pos = obj.data.root_pos_w - env.scene.env_origins
         h = pos[:, 2] - float(table_z)
         
-        # Must lift while grasped
         self._ever_lifted |= torch.logical_and(grasped, h > float(lift_height_thresh))
         
-        # Check final state
         gx, gy = float(goal_pos[0]), float(goal_pos[1])
         hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
         in_xy = torch.logical_and(
@@ -121,7 +98,6 @@ class PickPlaceSuccessWithLiftHistoryTerm(ManagerTermBase):
         open_frac = _gripper_open_fraction(env, robot_name=robot_name)
         opened = open_frac > float(open_thresh)
         
-        # Require lift history!
         history_ok = torch.logical_and(self._ever_grasped, self._ever_lifted)
         final_state_ok = torch.logical_and(torch.logical_and(in_xy, height_ok), opened)
         
@@ -135,12 +111,6 @@ def object_near_goal(
     xy_threshold: float = 0.05,
     z_threshold: float = 0.02,
 ) -> torch.Tensor:
-    """Check if an object is near a desired goal pose (simple place success).
-
-    This is intentionally simple for bring-up:
-    - XY distance to goal < xy_threshold
-    - |Z - goal_z| < z_threshold
-    """
     obj: RigidObject = env.scene[object_cfg.name]
     obj_pos = obj.data.root_pos_w - env.scene.env_origins
     goal = obj_pos.new_tensor(goal_pos).unsqueeze(0)
@@ -170,25 +140,20 @@ def cubes_stacked(
     pos_diff_c12 = cube_1.data.root_pos_w - cube_2.data.root_pos_w
     pos_diff_c23 = cube_2.data.root_pos_w - cube_3.data.root_pos_w
 
-    # Compute cube position difference in x-y plane
     xy_dist_c12 = torch.norm(pos_diff_c12[:, :2], dim=1)
     xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
 
-    # Compute cube height difference
     h_dist_c12 = torch.norm(pos_diff_c12[:, 2:], dim=1)
     h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
 
-    # Check cube positions
     stacked = torch.logical_and(xy_dist_c12 < xy_threshold, xy_dist_c23 < xy_threshold)
     stacked = torch.logical_and(h_dist_c12 - height_diff < height_threshold, stacked)
     stacked = torch.logical_and(pos_diff_c12[:, 2] < 0.0, stacked)
     stacked = torch.logical_and(h_dist_c23 - height_diff < height_threshold, stacked)
     stacked = torch.logical_and(pos_diff_c23[:, 2] < 0.0, stacked)
 
-    # Check gripper positions
     if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:
         surface_gripper = env.scene.surface_grippers["surface_gripper"]
-        # Keep everything shape (B,) to avoid accidental broadcasting to (B,B).
         suction_cup_status = surface_gripper.state.view(-1)  # 1: closed, 0: closing, -1: open
         suction_cup_is_open = (suction_cup_status == -1)
         stacked = torch.logical_and(suction_cup_is_open, stacked)
@@ -229,13 +194,6 @@ def object_in_goal_region(
     goal_half_extents_xy: tuple[float, float] = (0.05, 0.05),
     z_threshold: float = 0.03,
 ) -> torch.Tensor:
-    """Check if an object is inside a rectangular goal region on the table.
-
-    Region definition (env frame):
-    - |x - goal_x| <= hx
-    - |y - goal_y| <= hy
-    - |z - goal_z| <= z_threshold
-    """
     obj: RigidObject = env.scene[object_cfg.name]
     pos = obj.data.root_pos_w - env.scene.env_origins
     goal = pos.new_tensor(goal_center).unsqueeze(0)
@@ -252,8 +210,6 @@ def other_objects_outside_goal_region(
     goal_half_extents_xy: tuple[float, float] = (0.05, 0.05),
     margin: float = 0.02,
 ) -> torch.Tensor:
-    """Check that all other objects are outside the goal region (with a margin)."""
-    # Expand region slightly with margin
     hx, hy = float(goal_half_extents_xy[0] + margin), float(goal_half_extents_xy[1] + margin)
     goal_x, goal_y = float(goal_center[0]), float(goal_center[1])
 
@@ -278,12 +234,6 @@ def grasp_and_place_success(
     other_margin: float = 0.02,
     diff_threshold: float = 0.06,
 ) -> torch.Tensor:
-    """Success = (cube_2 grasped) AND (cube_2 in goal region) AND (other cubes not in goal region).
-
-    Notes:
-    - This uses privileged state for checking success, but the policy does NOT receive cube poses in observations.
-    - This matches your intended definition: 'correct cube grasped and place to the correct area'.
-    """
     grasped = object_grasped(
         env,
         robot_cfg=SceneEntityCfg(robot_name),
@@ -320,11 +270,6 @@ def place_and_release_success(
     other_margin: float = 0.02,
     diff_threshold: float = 0.06,
 ) -> torch.Tensor:
-    """Success = (object in goal region) AND (other cubes not in goal region) AND (gripper released).
-
-    "Released" is approximated as: NOT object_grasped(...) (i.e., gripper is no longer holding cube_2).
-    This matches your spec: placed at target AND gripper released.
-    """
     grasped = object_grasped(
         env,
         robot_cfg=SceneEntityCfg(robot_name),
@@ -351,7 +296,6 @@ def place_and_release_success(
 
 
 def _gripper_open_fraction(env: "ManagerBasedRLEnv", robot_name: str = "robot") -> torch.Tensor:
-    """Approximate gripper opening fraction in [0,1] (Franka hand)."""
     robot: Articulation = env.scene[robot_name]
     if not hasattr(env.cfg, "gripper_joint_names") or not hasattr(env.cfg, "gripper_open_val"):
         return torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
@@ -365,11 +309,6 @@ def _gripper_open_fraction(env: "ManagerBasedRLEnv", robot_name: str = "robot") 
 
 
 class FinalPlaceReleaseStableSuccessTerm(ManagerTermBase):
-    """Stateful success term: final placement + stability + release (no lift-history requirement).
-
-    This matches poe.pdf recommendation: success should depend on the *final state* (placed + stable + open),
-    and optionally require holding that state for N consecutive steps to avoid bounce.
-    """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -393,41 +332,28 @@ class FinalPlaceReleaseStableSuccessTerm(ManagerTermBase):
         open_thresh: float = 0.8,
         hold_steps: int = 5,
     ) -> torch.Tensor:
-        # position in env frame
         obj: RigidObject = env.scene[object_name]
         pos = obj.data.root_pos_w - env.scene.env_origins
         gx, gy = float(goal_center[0]), float(goal_center[1])
         hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
         in_xy = torch.logical_and(torch.abs(pos[:, 0] - gx) <= hx, torch.abs(pos[:, 1] - gy) <= hy)
 
-        # near table height (resting)
         h = (pos[:, 2] - float(table_z))
         height_ok = torch.abs(h) < float(place_height_tol)
 
-        # stable
         v = torch.linalg.vector_norm(obj.data.root_lin_vel_w, dim=1)
         stable = v < float(vel_thresh)
 
-        # gripper open
         open_frac = _gripper_open_fraction(env, robot_name=robot_name)
         opened = open_frac > float(open_thresh)
 
         good = torch.logical_and(torch.logical_and(torch.logical_and(in_xy, height_ok), stable), opened)
 
-        # consecutive-step requirement
         self._count = torch.where(good, self._count + 1, torch.zeros_like(self._count))
         return self._count >= int(hold_steps)
 
 
 class PickPlaceReleaseSuccessWithLiftHistoryTerm(ManagerTermBase):
-    """Stateful pick-and-place success that blocks the 'push-to-goal' exploit.
-
-    Success requires:
-    - The cube was grasped at least once (using `object_grasped(...)`)
-    - The cube was lifted above a threshold at least once while grasped
-    - Final state: cube in goal XY, near table height, stable, and gripper open
-    - Optionally held for N consecutive steps (debounce)
-    """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -455,11 +381,9 @@ class PickPlaceReleaseSuccessWithLiftHistoryTerm(ManagerTermBase):
         vel_thresh: float = 0.05,
         open_thresh: float = 0.8,
         hold_steps: int = 5,
-        # grasp/lift history gates
         diff_threshold: float = 0.06,
         lift_height_thresh: float = 0.03,
     ) -> torch.Tensor:
-        # --- history: grasp + lift while grasped ---
         grasped = object_grasped(
             env,
             robot_cfg=SceneEntityCfg(robot_name),
@@ -475,7 +399,6 @@ class PickPlaceReleaseSuccessWithLiftHistoryTerm(ManagerTermBase):
         lifted_now = torch.logical_and(grasped, h > float(lift_height_thresh))
         self._ever_lifted |= lifted_now
 
-        # --- final state: placed + stable + open ---
         gx, gy = float(goal_center[0]), float(goal_center[1])
         hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
         in_xy = torch.logical_and(torch.abs(pos[:, 0] - gx) <= hx, torch.abs(pos[:, 1] - gy) <= hy)
@@ -491,16 +414,11 @@ class PickPlaceReleaseSuccessWithLiftHistoryTerm(ManagerTermBase):
         success_ready = torch.logical_and(self._ever_grasped, self._ever_lifted)
         good = torch.logical_and(success_ready, final_ok)
 
-        # debounce
         self._count = torch.where(good, self._count + 1, torch.zeros_like(self._count))
         return self._count >= int(hold_steps)
 
 
 class SimplePickPlaceSuccessTerm(ManagerTermBase):
-    """Ultra-simple success termination: cube in goal, low, gripper open, held for N steps.
-    
-    No history tracking - just checks the current state like FetchPickAndPlace.
-    """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -526,7 +444,6 @@ class SimplePickPlaceSuccessTerm(ManagerTermBase):
         obj: RigidObject = env.scene[object_name]
         pos = obj.data.root_pos_w - env.scene.env_origins
         
-        # XY in goal
         gx, gy = float(goal_pos[0]), float(goal_pos[1])
         hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
         in_xy = torch.logical_and(
@@ -534,22 +451,18 @@ class SimplePickPlaceSuccessTerm(ManagerTermBase):
             torch.abs(pos[:, 1] - gy) <= hy
         )
         
-        # Height near table
         h = pos[:, 2] - float(table_z)
         height_ok = torch.abs(h) < float(place_height_tol)
         
-        # Gripper open
         open_frac = _gripper_open_fraction(env, robot_name=robot_name)
         opened = open_frac > float(open_thresh)
         
         good = torch.logical_and(torch.logical_and(in_xy, height_ok), opened)
         
-        # Debounce
         self._count = torch.where(good, self._count + 1, torch.zeros_like(self._count))
         return self._count >= int(hold_steps)
 
 
-# Alias for config compatibility
 def simple_pickplace_success(
     env: "ManagerBasedRLEnv",
     object_name: str,
@@ -561,25 +474,10 @@ def simple_pickplace_success(
     open_thresh: float = 0.5,
     hold_steps: int = 5,
 ) -> torch.Tensor:
-    """Wrapper to create SimplePickPlaceSuccessTerm - for use with DoneTerm."""
-    # This is a placeholder - the actual class-based term will be used
     raise NotImplementedError("Use SimplePickPlaceSuccessTerm class directly")
 
 
 class DropAfterLiftTerminationTerm(ManagerTermBase):
-    """Terminate if the cube is dropped after it has been lifted, except near-table place/release.
-
-    Intended behavior:
-    - Track whether the cube has *ever* been lifted above `lift_height_thresh` while grasped.
-    - Once lifted, if the cube becomes "not grasped" while still above `drop_height_thresh`,
-      we treat it as a mid-air drop and terminate (after a small debounce).
-    - Exception: if cube is inside goal XY and within `near_table_tol` of the table height,
-      do NOT terminate (this allows intentional release at placement).
-
-    Notes:
-    - Uses the current heuristic `object_grasped(...)`. To avoid flicker, we require
-      `ungrasp_grace_steps` consecutive steps of "not grasped" before terminating.
-    """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -601,12 +499,10 @@ class DropAfterLiftTerminationTerm(ManagerTermBase):
         goal_center: tuple[float, float, float],
         goal_half_extents_xy: tuple[float, float] = (0.05, 0.05),
         table_z: float = 0.0203,
-        # thresholds
         diff_threshold: float = 0.06,
         lift_height_thresh: float = 0.03,
         drop_height_thresh: float = 0.04,
         near_table_tol: float = 0.02,
-        # debounce for grasp-detector flicker
         ungrasp_grace_steps: int = 2,
     ) -> torch.Tensor:
         grasped = object_grasped(
@@ -621,24 +517,19 @@ class DropAfterLiftTerminationTerm(ManagerTermBase):
         pos = obj.data.root_pos_w - env.scene.env_origins
         h = pos[:, 2] - float(table_z)
 
-        # Update "ever lifted" state.
         self._ever_lifted |= torch.logical_and(grasped, h > float(lift_height_thresh))
 
-        # Allowed "release near table in goal region" (do not treat as drop).
         gx, gy = float(goal_center[0]), float(goal_center[1])
         hx, hy = float(goal_half_extents_xy[0]), float(goal_half_extents_xy[1])
         in_xy = torch.logical_and(torch.abs(pos[:, 0] - gx) <= hx, torch.abs(pos[:, 1] - gy) <= hy)
         near_table = torch.abs(h) <= float(near_table_tol)
         allowed_release_state = torch.logical_and(in_xy, near_table)
 
-        # Mid-air drop condition (after the task has truly lifted once).
         dropped_now = torch.logical_and(
             self._ever_lifted,
             torch.logical_and(torch.logical_not(grasped), h > float(drop_height_thresh)),
         )
-        # If it's an allowed release near table, don't count as drop.
         dropped_now = torch.logical_and(dropped_now, torch.logical_not(allowed_release_state))
 
-        # Debounce: require consecutive steps of dropped_now.
         self._ungrasp_count = torch.where(dropped_now, self._ungrasp_count + 1, torch.zeros_like(self._ungrasp_count))
         return self._ungrasp_count >= int(ungrasp_grace_steps)

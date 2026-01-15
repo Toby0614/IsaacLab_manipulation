@@ -1,11 +1,3 @@
-"""Environment wrapper that corrupts oracle object-pose observations.
-
-This wrapper does NOT change rewards/terminations or physics.
-It only edits the observation passed to the policy by corrupting the cube position signal that
-is included in the `proprio` group (see `pickplace_env_cfg.py`).
-
-Designed to implement the `poe3.pdf` plan: pose-dropout/noise/delay as a proxy for perception outages.
-"""
 
 from __future__ import annotations
 
@@ -18,7 +10,6 @@ from .pose_corruption_manager import PoseCorruptionManager
 
 
 class PoseCorruptionEnvWrapper(gym.Wrapper):
-    """Gym wrapper that corrupts cube position inside the `proprio` observation vector."""
 
     def __init__(self, env: gym.Env, cfg: PoseCorruptionCfg):
         super().__init__(env)
@@ -27,11 +18,8 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
         base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
         self.manager = PoseCorruptionManager(cfg=cfg, num_envs=base_env.num_envs, device=str(base_env.device))
 
-        # Attach for debugging/introspection
         base_env.pose_corruption_manager = self.manager
 
-        # Patch observation manager so all callers (including RslRlVecEnvWrapper.get_observations)
-        # see corrupted proprio consistently.
         self._maybe_patch_observation_manager()
 
         print(
@@ -45,7 +33,6 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
         if obs_mgr is None or not hasattr(obs_mgr, "compute"):
             return
 
-        # Avoid double patching
         if getattr(obs_mgr, "_pose_corruption_patched", False):
             return
 
@@ -59,21 +46,16 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
         obs_mgr._pose_corruption_patched = True  # type: ignore[attr-defined]
 
     def _corrupt_obs(self, obs: Any) -> Any:
-        """Corrupt cube_position slice in obs['proprio'] if configured."""
         if not self.cfg.enabled:
             return obs
 
-        # Support dict-like and TensorDict-like objects
         if hasattr(obs, "get") and hasattr(obs, "keys"):
-            # TensorDict behaves similarly to dict for key access
             if "proprio" not in obs:
                 return obs
             proprio = obs["proprio"]
             if not torch.is_tensor(proprio) or proprio.ndim != 2 or proprio.shape[1] < 3:
                 return obs
 
-            # Robustly find which columns correspond to the cube world position (x,y,z).
-            # The observation config concatenates many terms; cube position is NOT guaranteed to be last.
             base_env = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
 
             idxs = getattr(base_env, "__pose_corruption_cube_pos_indices", None)
@@ -81,7 +63,6 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
                 try:
                     obj = base_env.scene["cube_2"]
                     cube_pos_oracle = obj.data.root_pos_w - base_env.scene.env_origins  # (B,3)
-                    # Use small batch subset for matching (fast + stable).
                     b = int(min(64, proprio.shape[0]))
                     p = proprio[:b].float()
                     c = cube_pos_oracle[:b].float()
@@ -102,7 +83,6 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
                 setattr(base_env, "__pose_corruption_cube_pos_indices", idxs)
 
             if idxs is None:
-                # Fallback for older envs/checkpoints.
                 cube_pos = proprio[:, -3:]
                 write_mode = "slice"
             else:
@@ -137,12 +117,10 @@ class PoseCorruptionEnvWrapper(gym.Wrapper):
         if len(reset_env_ids) > 0:
             self.manager.reset(reset_env_ids)
 
-        # Note: actual corruption is applied via observation_manager.compute patch.
         return obs, reward, terminated, truncated, info
 
 
 class VecEnvPoseCorruptionWrapper:
-    """VecEnv-style wrapper variant (for symmetry with other wrappers)."""
 
     def __init__(self, env, cfg: PoseCorruptionCfg):
         self.env = env

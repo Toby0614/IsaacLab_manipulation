@@ -1,15 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
 
-"""Automatic phase detection for pick-and-place tasks.
-
-Detects which manipulation phase each environment is in based on state observations.
-Phases: reach, grasp, lift, transport, place
-
-This enables phase-aware modality dropout as described in poe2.pdf.
-"""
 
 from __future__ import annotations
 
@@ -25,58 +14,16 @@ if TYPE_CHECKING:
 
 
 class PickPlacePhaseDetector:
-    """Detects manipulation phase for pick-and-place tasks.
-    
-    Phase definitions:
-    - reach: Moving toward object, gripper open, object not grasped
-    - grasp: Near object, gripper closing or closed, but not lifted
-    - lift: Object grasped and lifted above threshold
-    - transport: Object lifted and moving toward goal
-    - place: Object at goal XY, lowering or releasing
-    
-    Usage:
-        detector = PickPlacePhaseDetector(
-            goal_pos=(0.70, 0.20, 0.0203),
-            table_z=0.0203,
-            lift_threshold=0.05,
-        )
-        
-        # In environment step:
-        phases = detector.detect_phases(env)
-        env.dropout_manager.update_phases(phases)
-    """
     
     def __init__(
         self,
-        # NOTE: Default aligned to this repo's Franka pick-and-place config goal:
-        # `.../config/franka/pickplace_env_cfg.py` sets GOAL_POS = (0.21, 0.28, 0.0203).
-        # If you change the task goal, pass it explicitly when constructing this detector.
         goal_pos: tuple[float, float, float] = (0.21, 0.28, 0.0203),
         table_z: float = 0.0203,
-        # Align with the task success threshold (pickplace_env_cfg.py uses lift_height_thresh=0.03).
         lift_threshold: float = 0.03,
         grasp_dist_threshold: float = 0.06,
-        # Goal region half extents are 0.05m; use a slightly larger radius for robustness.
         goal_xy_radius: float = 0.08,
-        # IMPORTANT:
-        # `transport_height_min` must be > `lift_threshold`, otherwise the detector will *never*
-        # output the "lift" phase because the logic checks `is_lifted and in_transport_height`
-        # before checking `is_lifted`.
-        #
-        # This directly affects phase-triggered corruption evaluation (poe3.pdf):
-        # if "lift" is unreachable, your "lift × duration" grid will show 0% corruption triggered.
         transport_height_min: float = 0.05,
     ):
-        """Initialize phase detector.
-        
-        Args:
-            goal_pos: Target placement position (x, y, z)
-            table_z: Table surface height
-            lift_threshold: Height above table to count as "lifted"
-            grasp_dist_threshold: Max EE-to-object distance to count as "grasped"
-            goal_xy_radius: XY distance to goal to count as "at goal"
-            transport_height_min: Min height during transport phase
-        """
         self.goal_pos = goal_pos
         self.table_z = table_z
         self.lift_threshold = lift_threshold
@@ -91,32 +38,22 @@ class PickPlacePhaseDetector:
         ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
         object_cfg: SceneEntityCfg = SceneEntityCfg("cube_2"),
     ) -> list[str]:
-        """Detect phase for each environment.
-        
-        Returns:
-            List of phase names, one per environment
-        """
         from isaaclab.assets import Articulation
         
         robot: Articulation = env.scene[robot_cfg.name]
         ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
         obj: RigidObject = env.scene[object_cfg.name]
         
-        # Get state variables
         obj_pos = obj.data.root_pos_w - env.scene.env_origins  # (B, 3)
         ee_pos = ee_frame.data.target_pos_w[:, 0, :] - env.scene.env_origins  # (B, 3)
         
-        # Distance from EE to object
         ee_to_obj_dist = torch.linalg.vector_norm(obj_pos - ee_pos, dim=1)  # (B,)
         
-        # Object height above table
         obj_height = obj_pos[:, 2] - self.table_z  # (B,)
         
-        # XY distance from object to goal
         goal_tensor = torch.tensor(self.goal_pos[:2], device=obj_pos.device, dtype=obj_pos.dtype)
         obj_to_goal_xy = torch.linalg.vector_norm(obj_pos[:, :2] - goal_tensor, dim=1)  # (B,)
         
-        # Gripper state (closed = grasping)
         if hasattr(env.cfg, "gripper_joint_names"):
             gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
             gripper_closed = (
@@ -126,10 +63,8 @@ class PickPlacePhaseDetector:
                 ) > env.cfg.gripper_threshold
             )  # (B,)
         else:
-            # Fallback: assume closed if close to object
             gripper_closed = ee_to_obj_dist < self.grasp_dist_threshold
         
-        # Phase detection logic per environment
         phases = []
         for i in range(env.num_envs):
             near_obj = ee_to_obj_dist[i] < self.grasp_dist_threshold
@@ -137,8 +72,6 @@ class PickPlacePhaseDetector:
             at_goal_xy = obj_to_goal_xy[i] < self.goal_xy_radius
             in_transport_height = obj_height[i] > self.transport_height_min
             
-            # Place/release happens near the goal while lowering and/or releasing, so do NOT require "lifted".
-            # This is intentionally a loose phase indicator for scheduling evaluation corruptions.
             if at_goal_xy:
                 phase = "place"
             elif is_lifted and in_transport_height:
@@ -155,14 +88,6 @@ class PickPlacePhaseDetector:
         return phases
     
     def get_phase_statistics(self, phases: list[str]) -> dict[str, int]:
-        """Get count of environments in each phase.
-        
-        Args:
-            phases: List of phase names from detect_phases()
-            
-        Returns:
-            Dictionary mapping phase name to count
-        """
         stats = {}
         for phase in ["reach", "grasp", "lift", "transport", "place"]:
             stats[phase] = phases.count(phase)

@@ -1,12 +1,3 @@
-"""Deterministic pose-corruption managers for evaluation (poe3.pdf plan).
-
-Implements:
-- Variant 1: phase-triggered pose corruption (phase × duration heatmap)
-- Variant 2: time-triggered pose corruption (onset × duration heatmap)
-
-This mirrors the existing vision dropout evaluation design, but targets the oracle cube position
-observation (pose estimate) instead of images.
-"""
 
 from __future__ import annotations
 
@@ -17,7 +8,6 @@ from .pose_corruption_manager import PoseCorruptionManager
 
 
 class PhaseTriggeredPoseCorruptionManager(PoseCorruptionManager):
-    """Trigger a corruption event when entering a target phase (once per episode)."""
 
     def __init__(
         self,
@@ -32,7 +22,6 @@ class PhaseTriggeredPoseCorruptionManager(PoseCorruptionManager):
         num_envs: int,
         device: str,
     ):
-        # Ensure stochastic start is disabled for deterministic evaluation.
         cfg = PoseCorruptionCfg(**{**cfg.__dict__})
         cfg.enabled = True
         cfg.event_probability = 0.0
@@ -74,10 +63,8 @@ class PhaseTriggeredPoseCorruptionManager(PoseCorruptionManager):
                 self.phase_stable_steps[i] += 1
 
     def step(self):
-        # base step handles counters, decrements, event expiry
         super().step()
 
-        # Trigger logic
         for i in range(self.num_envs):
             if bool(self.event_active[i].item()):
                 continue
@@ -91,7 +78,6 @@ class PhaseTriggeredPoseCorruptionManager(PoseCorruptionManager):
             if steps_in_phase < self.phase_entry_delay:
                 continue
 
-            # Trigger deterministic event
             self.event_active[i] = True
             self.remaining_steps[i] = int(self.duration_steps)
             self.event_just_started[i] = True
@@ -101,7 +87,6 @@ class PhaseTriggeredPoseCorruptionManager(PoseCorruptionManager):
 
 
 class TimeTriggeredPoseCorruptionManager(PoseCorruptionManager):
-    """Trigger a corruption event at a fixed onset step (once per episode)."""
 
     def __init__(
         self,

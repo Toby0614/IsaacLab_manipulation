@@ -1,3 +1,27 @@
+## instruction to validate results
+
+Follow the instruction ## Template for Isaac Lab Projects ## below to set up your isaaclab env
+
+The four policies are located at:
+logs/
+    M1_new
+    M2_new
+    M3_pose
+    M4_pose
+
+Feel free to run play.py to see the result yourself
+
+All key files are under:
+/<Your_dir>/source/Manipulation_policy/Manipulation_policy/tasks/manager_based/manipulation/stack/
+
+Please modify the directory yourself since many paths are hard coded.
+
+The files are quite messy so just run play.py and train.py since it's wired correctly now, and run run_eval.sh for evaluation.
+Shortcuts are in trash.sh
+
+Feel free to contact me for questions/problems: chantobias424@gmail.com
+
+
 # Template for Isaac Lab Projects
 
 ## Overview

@@ -1,15 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
 
-"""RSL-RL PPO CNN agent configuration for Franka pick-and-place.
-
-Key features:
-- Low initial noise (0.3) for stable learning
-- Multi-camera setup: wrist RGB-D (4ch) + table RGB (3ch) = 7 channels
-- CNN processes 64x64 images, output concatenated with proprio at MLP
-"""
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
@@ -17,27 +6,23 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class RslRlPpoActorCriticCNNCfg(RslRlPpoActorCriticCfg):
-    """Actor-critic with CNN encoder for multi-camera input."""
     actor_cnn_cfg: dict = None
     critic_cnn_cfg: dict = None
 
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """PPO Runner configuration."""
     
     num_steps_per_env = 32
     max_iterations = 8000
     save_interval = 500
     experiment_name = "franka_pickplace"
 
-    # Observation groups: proprio (vector) + multi_cam (7ch images)
     obs_groups = {
         "policy": ["proprio", "multi_cam"],
         "critic": ["proprio", "multi_cam"],
     }
 
-    # Actor-Critic CNN policy
     policy = RslRlPpoActorCriticCNNCfg(
         class_name="ActorCriticCNN",
         init_noise_std=0.3,  # Low noise for stable learning
@@ -46,7 +31,6 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
-        # CNN for 64x64 images with 7 input channels
         actor_cnn_cfg={
             "output_channels": [32, 64, 128],
             "kernel_size": [8, 4, 3],

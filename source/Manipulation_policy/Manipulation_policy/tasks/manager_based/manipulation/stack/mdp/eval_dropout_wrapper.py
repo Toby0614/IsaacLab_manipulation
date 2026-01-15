@@ -1,15 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
 
-"""Evaluation dropout wrappers for Variant 1 (phase-based) and Variant 2 (time-based).
-
-These wrappers provide deterministic, reproducible dropout scheduling for
-systematic evaluation of policy robustness under vision failures.
-
-Based on poe2.pdf recommendations for 2D sensitivity analysis.
-"""
 
 from __future__ import annotations
 
@@ -22,7 +11,6 @@ from .phase_detector import PickPlacePhaseDetector
 
 
 class EvalDropoutManagerBase:
-    """Base dropout manager for evaluation with deterministic scheduling."""
     
     def __init__(
         self,
@@ -42,16 +30,13 @@ class EvalDropoutManagerBase:
         self.hard_dropout_value_rgb = hard_dropout_value_rgb
         self.hard_dropout_value_depth = hard_dropout_value_depth
         
-        # Per-environment state
         self.dropout_active = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.dropout_remaining_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
         self.episode_step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
         
-        # Statistics tracking
         self.dropout_triggered_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
     
     def reset(self, env_ids: torch.Tensor):
-        """Reset dropout state for specified environments."""
         if env_ids is None or len(env_ids) == 0:
             return
         
@@ -61,13 +46,10 @@ class EvalDropoutManagerBase:
         self.dropout_triggered_count[env_ids] = 0
     
     def step(self):
-        """Update dropout state - to be implemented by subclasses."""
         self.episode_step_count += 1
         
-        # Decrement remaining steps
         self.dropout_remaining_steps = torch.clamp(self.dropout_remaining_steps - 1, min=0)
         
-        # Deactivate when duration expires
         expired = self.dropout_active & (self.dropout_remaining_steps <= 0)
         self.dropout_active[expired] = False
     
@@ -76,11 +58,9 @@ class EvalDropoutManagerBase:
         rgb: torch.Tensor,
         depth: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply dropout to images."""
         if not self.dropout_active.any():
             return rgb, depth
         
-        # Clone to avoid in-place modification
         rgb_out = rgb.clone()
         depth_out = depth.clone()
         
@@ -97,8 +77,6 @@ class EvalDropoutManagerBase:
         depth: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply hard dropout (blackout)."""
-        # Reshape mask for broadcasting (B, 1, 1, 1)
         broadcast_mask = mask.view(-1, 1, 1, 1)
         
         if self.dropout_rgb:
@@ -115,7 +93,6 @@ class EvalDropoutManagerBase:
         return rgb, depth
     
     def get_stats(self) -> dict:
-        """Get dropout statistics."""
         return {
             "dropout_active_count": self.dropout_active.sum().item(),
             "dropout_triggered_total": self.dropout_triggered_count.sum().item(),
@@ -123,10 +100,6 @@ class EvalDropoutManagerBase:
 
 
 class Variant1PhaseDropoutManager(EvalDropoutManagerBase):
-    """Variant 1: Phase-based dropout manager.
-    
-    Triggers dropout when entering a specific manipulation phase.
-    """
     
     def __init__(
         self,
@@ -152,7 +125,6 @@ class Variant1PhaseDropoutManager(EvalDropoutManagerBase):
         self.require_stable = cfg.require_stable_phase
         self.stable_steps_required = cfg.stable_phase_steps
         
-        # Phase tracking
         self.current_phase = ["reach"] * num_envs
         self.previous_phase = ["reach"] * num_envs
         self.phase_stable_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
@@ -160,7 +132,6 @@ class Variant1PhaseDropoutManager(EvalDropoutManagerBase):
         self.phase_entry_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
     
     def reset(self, env_ids: torch.Tensor):
-        """Reset phase tracking for specified environments."""
         super().reset(env_ids)
         
         if env_ids is None or len(env_ids) == 0:
@@ -175,11 +146,9 @@ class Variant1PhaseDropoutManager(EvalDropoutManagerBase):
         self.phase_entry_step[env_ids] = 0
     
     def update_phases(self, phases: list[str]):
-        """Update detected phases for all environments."""
         assert len(phases) == self.num_envs
         
         for i, phase in enumerate(phases):
-            # Track phase transitions
             if phase != self.current_phase[i]:
                 self.previous_phase[i] = self.current_phase[i]
                 self.current_phase[i] = phase
@@ -189,33 +158,25 @@ class Variant1PhaseDropoutManager(EvalDropoutManagerBase):
                 self.phase_stable_steps[i] += 1
     
     def step(self):
-        """Check for phase-based dropout triggers."""
         super().step()
         
-        # Check each environment for trigger conditions
         for i in range(self.num_envs):
-            # Skip if already in dropout
             if self.dropout_active[i]:
                 continue
             
-            # Skip if already triggered this episode (if once-per-episode mode)
             if self.trigger_once and self.dropout_triggered_this_episode[i]:
                 continue
             
-            # Check if in target phase
             if self.current_phase[i] != self.target_phase:
                 continue
             
-            # Check stability requirement
             if self.require_stable and self.phase_stable_steps[i] < self.stable_steps_required:
                 continue
             
-            # Check entry delay
             steps_in_phase = self.episode_step_count[i].item() - self.phase_entry_step[i].item()
             if steps_in_phase < self.phase_entry_delay:
                 continue
             
-            # Trigger dropout
             self.dropout_active[i] = True
             self.dropout_remaining_steps[i] = self.dropout_duration
             self.dropout_triggered_this_episode[i] = True
@@ -223,10 +184,6 @@ class Variant1PhaseDropoutManager(EvalDropoutManagerBase):
 
 
 class Variant2TimeDropoutManager(EvalDropoutManagerBase):
-    """Variant 2: Time-based (onset-time) dropout manager.
-    
-    Triggers dropout at a specific timestep in the episode.
-    """
     
     def __init__(
         self,
@@ -248,11 +205,9 @@ class Variant2TimeDropoutManager(EvalDropoutManagerBase):
         self.onset_step = cfg.onset_step
         self.dropout_duration = cfg.dropout_duration_steps
         
-        # Track if dropout has been triggered this episode
         self.dropout_triggered_this_episode = torch.zeros(num_envs, dtype=torch.bool, device=device)
     
     def reset(self, env_ids: torch.Tensor):
-        """Reset time tracking for specified environments."""
         super().reset(env_ids)
         
         if env_ids is None or len(env_ids) == 0:
@@ -261,10 +216,8 @@ class Variant2TimeDropoutManager(EvalDropoutManagerBase):
         self.dropout_triggered_this_episode[env_ids] = False
     
     def step(self):
-        """Check for time-based dropout triggers."""
         super().step()
         
-        # Check for onset time trigger
         should_trigger = (
             (self.episode_step_count == self.onset_step) &
             (~self.dropout_triggered_this_episode) &
@@ -279,14 +232,6 @@ class Variant2TimeDropoutManager(EvalDropoutManagerBase):
 
 
 class Variant1EvalWrapper(gym.Wrapper):
-    """Environment wrapper for Variant 1 (phase-based) dropout evaluation.
-    
-    Usage:
-        from .eval_dropout_cfg import Variant1PhaseDropoutCfg
-        
-        cfg = Variant1PhaseDropoutCfg(target_phase="grasp", dropout_duration_steps=40)
-        env = Variant1EvalWrapper(base_env, cfg)
-    """
     
     def __init__(
         self,
@@ -298,17 +243,14 @@ class Variant1EvalWrapper(gym.Wrapper):
         
         self.cfg = cfg
         
-        # Create dropout manager
         self.dropout_manager = Variant1PhaseDropoutManager(
             cfg=cfg,
             num_envs=self.env.unwrapped.num_envs,
             device=str(self.env.unwrapped.device),
         )
         
-        # Attach to unwrapped env for observation functions
         self.env.unwrapped.dropout_manager = self.dropout_manager
         
-        # Create phase detector
         phase_kwargs = phase_detector_kwargs or {}
         self.phase_detector = PickPlacePhaseDetector(**phase_kwargs)
         
@@ -325,17 +267,14 @@ class Variant1EvalWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
-        # Detect and update phases
         try:
             phases = self.phase_detector.detect_phases(self.env.unwrapped)
             self.dropout_manager.update_phases(phases)
         except Exception as e:
             pass  # Continue without phase update on error
         
-        # Update dropout state
         self.dropout_manager.step()
         
-        # Handle resets
         done = terminated | truncated
         reset_env_ids = done.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
@@ -348,14 +287,6 @@ class Variant1EvalWrapper(gym.Wrapper):
 
 
 class Variant2EvalWrapper(gym.Wrapper):
-    """Environment wrapper for Variant 2 (time-based) dropout evaluation.
-    
-    Usage:
-        from .eval_dropout_cfg import Variant2TimeDropoutCfg
-        
-        cfg = Variant2TimeDropoutCfg(onset_step=50, dropout_duration_steps=30)
-        env = Variant2EvalWrapper(base_env, cfg)
-    """
     
     def __init__(
         self,
@@ -366,14 +297,12 @@ class Variant2EvalWrapper(gym.Wrapper):
         
         self.cfg = cfg
         
-        # Create dropout manager
         self.dropout_manager = Variant2TimeDropoutManager(
             cfg=cfg,
             num_envs=self.env.unwrapped.num_envs,
             device=str(self.env.unwrapped.device),
         )
         
-        # Attach to unwrapped env for observation functions
         self.env.unwrapped.dropout_manager = self.dropout_manager
         
         print(f"[Variant2EvalWrapper] Onset={cfg.onset_step}, Duration={cfg.dropout_duration_steps} steps")
@@ -389,10 +318,8 @@ class Variant2EvalWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
-        # Update dropout state
         self.dropout_manager.step()
         
-        # Handle resets
         done = terminated | truncated
         reset_env_ids = done.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
@@ -404,12 +331,8 @@ class Variant2EvalWrapper(gym.Wrapper):
         return self.dropout_manager.get_stats()
 
 
-# =============================================================================
-# Alternative VecEnv wrappers (for compatibility with some training loops)
-# =============================================================================
 
 class VecEnvVariant1EvalWrapper:
-    """VecEnv-style wrapper for Variant 1 evaluation."""
     
     def __init__(
         self,
@@ -473,7 +396,6 @@ class VecEnvVariant1EvalWrapper:
 
 
 class VecEnvVariant2EvalWrapper:
-    """VecEnv-style wrapper for Variant 2 evaluation."""
     
     def __init__(
         self,
