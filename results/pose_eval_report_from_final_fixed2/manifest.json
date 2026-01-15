@@ -1,0 +1,23 @@
+{
+  "input_dir": "results/pose_eval_final_fixed2",
+  "output_dir": "results/pose_eval_report_from_final_fixed2",
+  "policies": [
+    "M1_policy",
+    "M2_policy",
+    "M3_pose",
+    "M4_pose"
+  ],
+  "modes": [
+    "delay",
+    "freeze",
+    "hard",
+    "noise"
+  ],
+  "variants": [
+    1,
+    2
+  ],
+  "baseline_kind": "min_duration",
+  "baseline_duration": null,
+  "notes": "If L50 looks surprising, confirm baseline choice and whether duration=0 (clean) is available."
+}

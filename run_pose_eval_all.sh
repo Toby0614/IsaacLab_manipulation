@@ -18,7 +18,7 @@ set -euo pipefail
 
 cd /home/toby0614/IsaacLab/Projects/Manipulation_policy
 
-OUT_DIR="results/pose_eval_final"
+OUT_DIR="results/pose_eval_final_fixed2"
 mkdir -p "${OUT_DIR}"
 # -----------------------------------------------------------------------------
 # TODO: EDIT THESE FOUR PATHS TO POINT TO THE EXACT .pt FILES YOU WANT TO EVAL
@@ -52,13 +52,16 @@ POSE_EVAL_ARGS="--eval_pose_corruption \
   --pose_eval_phases reach,grasp,lift,transport,place \
   --pose_eval_onset_steps 1,5,10,15,20,25,30,35 \
   --pose_eval_durations 5,10,20,40,80 \
-  --pose_eval_modes hard,freeze,noise,delay \
+  --pose_eval_modes hard,freeze,delay,noise \
   --pose_eval_episodes 500 \
+  --pose_eval_require_triggered \
+  --pose_eval_success_metric triggered \
+  --pose_eval_max_attempts_multiplier 10 \
   --pose_eval_output_dir ${OUT_DIR} \
   --pose_eval_delay_steps 5 \
   --pose_eval_noise_std 0.01 \
   --pose_eval_drift_noise_std 0.001 \
-  --num_envs 1200 \
+  --num_envs 1600 \
   --headless \
   --enable_cameras"
 

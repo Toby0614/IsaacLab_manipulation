@@ -75,3 +75,10 @@ python scripts/rsl_rl/train.py \
 
 # Evaluation
 bash run_pose_eval_all.sh
+
+
+# success rate
+M1 = 0.8717
+M2 = 0.8933
+M3 = 0.9446
+M4 = 0.961

@@ -175,6 +175,35 @@ parser.add_argument(
 parser.add_argument("--pose_eval_delay_steps", type=int, default=5, help="Delay steps used when pose mode is 'delay'.")
 parser.add_argument("--pose_eval_noise_std", type=float, default=0.01, help="Pose noise std (meters) used for 'noise'.")
 parser.add_argument("--pose_eval_drift_noise_std", type=float, default=0.001, help="Pose drift noise std (meters) used for 'noise'.")
+parser.add_argument(
+    "--pose_eval_require_triggered",
+    action="store_true",
+    default=False,
+    help=(
+        "If set, collect exactly pose_eval_episodes episodes WHERE corruption actually triggered "
+        "(instead of pose_eval_episodes total episodes). This removes 'untriggered episode' confounds."
+    ),
+)
+parser.add_argument(
+    "--pose_eval_max_attempts_multiplier",
+    type=int,
+    default=10,
+    help=(
+        "Max attempts multiplier when --pose_eval_require_triggered is set. "
+        "We stop after max_attempts_multiplier * pose_eval_episodes episodes and report what we got."
+    ),
+)
+parser.add_argument(
+    "--pose_eval_success_metric",
+    type=str,
+    default="triggered",
+    choices=["triggered", "all"],
+    help=(
+        "Which success metric to use in pose-eval summaries/heatmaps. "
+        "'triggered' uses only episodes where corruption triggered (default). "
+        "'all' counts untriggered episodes as failures (avoids selection bias for late phases)."
+    ),
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -223,7 +252,7 @@ import glob
 import json
 import numpy as np
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -263,9 +292,25 @@ class EvalResult:
     std_episode_length: float
     num_episodes: int
     dropout_triggered_rate: float
+    success_rate_all: float = 0.0
     # Pose-corruption specific diagnostics (kept optional-ish via defaults so dropout eval doesn't break)
     corruption_step_rate: float = 0.0
     corruption_episode_rate: float = 0.0
+    # Conditional success diagnostics (helps detect "event did not trigger" confounds)
+    success_rate_triggered: float = 0.0
+    success_rate_untriggered: float = 0.0
+    num_triggered_episodes: int = 0
+    num_untriggered_episodes: int = 0
+    # Phase-duration diagnostics (policy steps per episode; useful for validating phase separation)
+    phase_steps_mean: dict[str, float] = field(default_factory=dict)
+    phase_steps_std: dict[str, float] = field(default_factory=dict)
+    # Triggered-only collection diagnostics (for fair evaluation across policies/conditions)
+    episodes_attempted: int = 0
+    episodes_target: int = 0
+    # Success-count diagnostics (useful for verifying "successful-only" phase stats sample size)
+    num_success_episodes: int = 0
+    num_success_triggered_episodes: int = 0
+    num_success_untriggered_episodes: int = 0
 
 
 @dataclass
@@ -807,9 +852,20 @@ def run_evaluation_episodes_pose_v1(
     num_envs = env.unwrapped.num_envs
 
     successes = []
+    successes_triggered = []
+    successes_untriggered = []
     episode_lengths = []
+    episode_lengths_triggered = []
+    episode_lengths_untriggered = []
     triggered = []
     corrupted_step_rates = []
+    corrupted_step_rates_triggered = []
+    corrupted_step_rates_untriggered = []
+    # Per-env phase step counters (policy steps) and per-episode collected stats (SUCCESSFUL ONLY)
+    phase_names = ["reach", "grasp", "lift", "transport", "place"]
+    phase_to_idx = {p: i for i, p in enumerate(phase_names)}
+    env_phase_steps = torch.zeros((num_envs, len(phase_names)), dtype=torch.int32, device=device)
+    per_success_episode_phase_steps: list[np.ndarray] = []
 
     # -------------------------------------------------------------------------
     # IMPORTANT (speed + correctness with large num_envs):
@@ -820,6 +876,10 @@ def run_evaluation_episodes_pose_v1(
     # - collect exactly ONE episode from each sampled env
     # This removes completion-time bias while still benefiting from parallel simulation throughput.
     # -------------------------------------------------------------------------
+    require_triggered = bool(getattr(env.unwrapped, "__pose_eval_require_triggered", False))
+    max_attempts_multiplier = int(getattr(env.unwrapped, "__pose_eval_max_attempts_multiplier", 10))
+    target_triggered_episodes = int(num_episodes)
+
     target_env_count = int(min(num_episodes, num_envs))
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(seed) + 1337)
@@ -829,6 +889,7 @@ def run_evaluation_episodes_pose_v1(
     is_target_env[target_env_ids] = True
     collected_for_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
     episodes_completed = 0
+    episodes_attempted = 0
 
     # Reset env at the start of EACH condition so "trigger on entering phase" is meaningful.
     # This fixes the poe4.pdf issue where conditions could begin mid-episode.
@@ -853,12 +914,24 @@ def run_evaluation_episodes_pose_v1(
     env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
     env_corrupted_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
-    while episodes_completed < num_episodes:
+    # If require_triggered is enabled, we keep collecting until we have N *triggered* episodes,
+    # or until we exceed a safety cap on attempts.
+    max_attempts = int(max_attempts_multiplier) * int(target_triggered_episodes) if require_triggered else int(target_triggered_episodes)
+    stop_collection = False
+    while episodes_completed < target_triggered_episodes:
+        if require_triggered and episodes_attempted >= max_attempts:
+            break
         with torch.inference_mode():
             # Update phases and pose manager BEFORE action
             try:
                 phases = phase_detector.detect_phases(env.unwrapped)
                 pose_manager.update_phases(phases)
+                # Count phase occupancy (one step per policy step).
+                # This is intentionally loose: it's for reporting "how long the policy spends in each phase".
+                for i, ph in enumerate(phases):
+                    j = phase_to_idx.get(ph, None)
+                    if j is not None:
+                        env_phase_steps[i, j] += 1
             except Exception:
                 pass
             pose_manager.step()
@@ -899,12 +972,19 @@ def run_evaluation_episodes_pose_v1(
             done_indices = done.nonzero(as_tuple=False).squeeze(-1)
 
             for idx in done_indices.cpu().tolist():
-                if episodes_completed >= target_env_count:
+                # Stop immediately if we've already collected enough triggered episodes.
+                if require_triggered and episodes_completed >= target_triggered_episodes:
+                    stop_collection = True
+                    break
+                if episodes_completed >= target_env_count and not require_triggered:
+                    stop_collection = True
                     break
                 if not bool(is_target_env[idx].item()):
                     continue
                 if bool(collected_for_env[idx].item()):
-                    continue
+                    # In triggered-only mode we may need multiple episodes per env.
+                    if not require_triggered:
+                        continue
 
                 # success via termination_manager term (task success)
                 success = False
@@ -921,30 +1001,95 @@ def run_evaluation_episodes_pose_v1(
                 episode_lengths.append(env_episode_step[idx].item())
                 did_trigger = float(pose_manager.triggered_count[idx].item() > 0)
                 triggered.append(did_trigger)
+                if did_trigger > 0.0:
+                    successes_triggered.append(float(success))
+                    episode_lengths_triggered.append(env_episode_step[idx].item())
+                else:
+                    successes_untriggered.append(float(success))
+                    episode_lengths_untriggered.append(env_episode_step[idx].item())
+                # Save phase steps for this episode ONLY IF SUCCESSFUL.
+                # If triggered-only collection is enabled, only count successful episodes where corruption triggered.
+                if success and ((not require_triggered) or (did_trigger > 0.0)):
+                    per_success_episode_phase_steps.append(
+                        env_phase_steps[idx].detach().cpu().to(dtype=torch.float32).numpy()
+                    )
                 # timestep-level corruption fraction for this episode
                 ep_steps = max(int(env_episode_step[idx].item()), 1)
                 ep_corr = int(env_corrupted_steps[idx].item())
-                corrupted_step_rates.append(float(ep_corr / ep_steps))
-                collected_for_env[idx] = True
-                episodes_completed += 1
+                csr = float(ep_corr / ep_steps)
+                corrupted_step_rates.append(csr)
+                if did_trigger > 0.0:
+                    corrupted_step_rates_triggered.append(csr)
+                else:
+                    corrupted_step_rates_untriggered.append(csr)
+                episodes_attempted += 1
+
+                if require_triggered:
+                    # Only count episodes where corruption actually triggered.
+                    if did_trigger > 0.0:
+                        episodes_completed += 1
+                        if episodes_completed >= target_triggered_episodes:
+                            stop_collection = True
+                            break
+                else:
+                    collected_for_env[idx] = True
+                    episodes_completed += 1
+                    if episodes_completed >= target_env_count:
+                        stop_collection = True
+                        break
 
             if len(done_indices) > 0:
                 env_episode_step[done_indices] = 0
                 env_corrupted_steps[done_indices] = 0
+                env_phase_steps[done_indices] = 0
                 pose_manager.reset(done_indices)
 
             policy_nn.reset(done)
+            if stop_collection:
+                break
+
+    # Aggregate phase steps across SUCCESSFUL episodes only (policy steps).
+    if per_success_episode_phase_steps:
+        mat = np.stack(per_success_episode_phase_steps, axis=0)  # (E, P)
+        phase_steps_mean = {p: float(np.mean(mat[:, i])) for i, p in enumerate(phase_names)}
+        phase_steps_std = {p: float(np.std(mat[:, i])) for i, p in enumerate(phase_names)}
+    else:
+        phase_steps_mean = {}
+        phase_steps_std = {}
+
+    # When require_triggered=True, we report headline metrics *over triggered episodes only*,
+    # since that is the intended evaluation set.
+    if require_triggered:
+        base_successes = successes_triggered
+        base_lengths = episode_lengths_triggered
+        base_csrs = corrupted_step_rates_triggered
+        num_base = int(episodes_completed)
+    else:
+        base_successes = successes
+        base_lengths = episode_lengths
+        base_csrs = corrupted_step_rates
+        num_base = int(episodes_attempted)
 
     return {
-        "success_rate": np.mean(successes) if successes else 0.0,
-        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
-        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
-        "num_episodes": int(episodes_completed),
-        # Keep original key for backward compatibility with your printing/saving pipeline,
-        # but interpret it as "timestep-level corruption rate" for poe3 evaluation.
-        "dropout_triggered_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
-        "corruption_step_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
+        "success_rate": np.mean(base_successes) if base_successes else 0.0,
+        "success_rate_all": np.mean(successes) if successes else 0.0,
+        "success_rate_triggered": np.mean(successes_triggered) if successes_triggered else 0.0,
+        "success_rate_untriggered": np.mean(successes_untriggered) if successes_untriggered else 0.0,
+        "mean_episode_length": np.mean(base_lengths) if base_lengths else 0.0,
+        "std_episode_length": np.std(base_lengths) if base_lengths else 0.0,
+        "num_episodes": num_base,
+        "num_triggered_episodes": int(len(successes_triggered)),
+        "num_untriggered_episodes": int(len(successes_untriggered)),
+        "num_success_episodes": int(np.sum(base_successes)) if base_successes else 0,
+        "num_success_triggered_episodes": int(np.sum(successes_triggered)) if successes_triggered else 0,
+        "num_success_untriggered_episodes": int(np.sum(successes_untriggered)) if successes_untriggered else 0,
+        "episodes_attempted": int(episodes_attempted),
+        "episodes_target": int(target_triggered_episodes),
+        "dropout_triggered_rate": np.mean(base_csrs) if base_csrs else 0.0,
+        "corruption_step_rate": np.mean(base_csrs) if base_csrs else 0.0,
         "corruption_episode_rate": np.mean(triggered) if triggered else 0.0,
+        "phase_steps_mean": phase_steps_mean,
+        "phase_steps_std": phase_steps_std,
     }
 
 
@@ -962,9 +1107,26 @@ def run_evaluation_episodes_pose_v2(
     num_envs = env.unwrapped.num_envs
 
     successes = []
+    successes_triggered = []
+    successes_untriggered = []
     episode_lengths = []
+    episode_lengths_triggered = []
+    episode_lengths_untriggered = []
     triggered = []
     corrupted_step_rates = []
+    corrupted_step_rates_triggered = []
+    corrupted_step_rates_untriggered = []
+    # Phase duration diagnostics are still useful in v2; compute phases each step.
+    from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.phase_detector import PickPlacePhaseDetector
+    phase_detector = PickPlacePhaseDetector()
+    phase_names = ["reach", "grasp", "lift", "transport", "place"]
+    phase_to_idx = {p: i for i, p in enumerate(phase_names)}
+    env_phase_steps = torch.zeros((num_envs, len(phase_names)), dtype=torch.int32, device=device)
+    per_success_episode_phase_steps: list[np.ndarray] = []
+
+    require_triggered = bool(getattr(env.unwrapped, "__pose_eval_require_triggered", False))
+    max_attempts_multiplier = int(getattr(env.unwrapped, "__pose_eval_max_attempts_multiplier", 10))
+    target_triggered_episodes = int(num_episodes)
 
     target_env_count = int(min(num_episodes, num_envs))
     gen = torch.Generator(device="cpu")
@@ -975,6 +1137,7 @@ def run_evaluation_episodes_pose_v2(
     is_target_env[target_env_ids] = True
     collected_for_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
     episodes_completed = 0
+    episodes_attempted = 0
     all_env_ids = torch.arange(num_envs, device=device)
     pose_manager.reset(all_env_ids)
 
@@ -995,9 +1158,22 @@ def run_evaluation_episodes_pose_v2(
     env_episode_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
     env_corrupted_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
-    while episodes_completed < num_episodes:
+    max_attempts = int(max_attempts_multiplier) * int(target_triggered_episodes) if require_triggered else int(target_triggered_episodes)
+    stop_collection = False
+    while episodes_completed < target_triggered_episodes:
+        if require_triggered and episodes_attempted >= max_attempts:
+            break
         with torch.inference_mode():
             pose_manager.step()
+            # Phase occupancy counter (best-effort).
+            try:
+                phases = phase_detector.detect_phases(env.unwrapped)
+                for i, ph in enumerate(phases):
+                    j = phase_to_idx.get(ph, None)
+                    if j is not None:
+                        env_phase_steps[i, j] += 1
+            except Exception:
+                pass
 
             # Count timestep-level corruption (before action; corresponds to corrupted observation this step).
             env_corrupted_steps += pose_manager.event_active.to(dtype=torch.int32)
@@ -1035,12 +1211,18 @@ def run_evaluation_episodes_pose_v2(
             done_indices = done.nonzero(as_tuple=False).squeeze(-1)
 
             for idx in done_indices.cpu().tolist():
-                if episodes_completed >= target_env_count:
+                # Stop immediately if we've already collected enough triggered episodes.
+                if require_triggered and episodes_completed >= target_triggered_episodes:
+                    stop_collection = True
+                    break
+                if episodes_completed >= target_env_count and not require_triggered:
+                    stop_collection = True
                     break
                 if not bool(is_target_env[idx].item()):
                     continue
                 if bool(collected_for_env[idx].item()):
-                    continue
+                    if not require_triggered:
+                        continue
 
                 success = False
                 try:
@@ -1056,27 +1238,87 @@ def run_evaluation_episodes_pose_v2(
                 episode_lengths.append(env_episode_step[idx].item())
                 did_trigger = float(pose_manager.triggered_count[idx].item() > 0)
                 triggered.append(did_trigger)
+                if did_trigger > 0.0:
+                    successes_triggered.append(float(success))
+                    episode_lengths_triggered.append(env_episode_step[idx].item())
+                else:
+                    successes_untriggered.append(float(success))
+                    episode_lengths_untriggered.append(env_episode_step[idx].item())
+                if success and ((not require_triggered) or (did_trigger > 0.0)):
+                    per_success_episode_phase_steps.append(
+                        env_phase_steps[idx].detach().cpu().to(dtype=torch.float32).numpy()
+                    )
                 ep_steps = max(int(env_episode_step[idx].item()), 1)
                 ep_corr = int(env_corrupted_steps[idx].item())
-                corrupted_step_rates.append(float(ep_corr / ep_steps))
-                collected_for_env[idx] = True
-                episodes_completed += 1
+                csr = float(ep_corr / ep_steps)
+                corrupted_step_rates.append(csr)
+                if did_trigger > 0.0:
+                    corrupted_step_rates_triggered.append(csr)
+                else:
+                    corrupted_step_rates_untriggered.append(csr)
+                episodes_attempted += 1
+                if require_triggered:
+                    if did_trigger > 0.0:
+                        episodes_completed += 1
+                        if episodes_completed >= target_triggered_episodes:
+                            stop_collection = True
+                            break
+                else:
+                    collected_for_env[idx] = True
+                    episodes_completed += 1
+                    if episodes_completed >= target_env_count:
+                        stop_collection = True
+                        break
 
             if len(done_indices) > 0:
                 env_episode_step[done_indices] = 0
                 env_corrupted_steps[done_indices] = 0
+                env_phase_steps[done_indices] = 0
                 pose_manager.reset(done_indices)
 
             policy_nn.reset(done)
+            if stop_collection:
+                break
+
+    if per_success_episode_phase_steps:
+        mat = np.stack(per_success_episode_phase_steps, axis=0)
+        phase_steps_mean = {p: float(np.mean(mat[:, i])) for i, p in enumerate(phase_names)}
+        phase_steps_std = {p: float(np.std(mat[:, i])) for i, p in enumerate(phase_names)}
+    else:
+        phase_steps_mean = {}
+        phase_steps_std = {}
+
+    if require_triggered:
+        base_successes = successes_triggered
+        base_lengths = episode_lengths_triggered
+        base_csrs = corrupted_step_rates_triggered
+        num_base = int(episodes_completed)
+    else:
+        base_successes = successes
+        base_lengths = episode_lengths
+        base_csrs = corrupted_step_rates
+        num_base = int(episodes_attempted)
 
     return {
-        "success_rate": np.mean(successes) if successes else 0.0,
-        "mean_episode_length": np.mean(episode_lengths) if episode_lengths else 0.0,
-        "std_episode_length": np.std(episode_lengths) if episode_lengths else 0.0,
-        "num_episodes": int(episodes_completed),
-        "dropout_triggered_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
-        "corruption_step_rate": np.mean(corrupted_step_rates) if corrupted_step_rates else 0.0,
+        "success_rate": np.mean(base_successes) if base_successes else 0.0,
+        "success_rate_all": np.mean(successes) if successes else 0.0,
+        "success_rate_triggered": np.mean(successes_triggered) if successes_triggered else 0.0,
+        "success_rate_untriggered": np.mean(successes_untriggered) if successes_untriggered else 0.0,
+        "mean_episode_length": np.mean(base_lengths) if base_lengths else 0.0,
+        "std_episode_length": np.std(base_lengths) if base_lengths else 0.0,
+        "num_episodes": num_base,
+        "num_triggered_episodes": int(len(successes_triggered)),
+        "num_untriggered_episodes": int(len(successes_untriggered)),
+        "num_success_episodes": int(np.sum(base_successes)) if base_successes else 0,
+        "num_success_triggered_episodes": int(np.sum(successes_triggered)) if successes_triggered else 0,
+        "num_success_untriggered_episodes": int(np.sum(successes_untriggered)) if successes_untriggered else 0,
+        "episodes_attempted": int(episodes_attempted),
+        "episodes_target": int(target_triggered_episodes),
+        "dropout_triggered_rate": np.mean(base_csrs) if base_csrs else 0.0,
+        "corruption_step_rate": np.mean(base_csrs) if base_csrs else 0.0,
         "corruption_episode_rate": np.mean(triggered) if triggered else 0.0,
+        "phase_steps_mean": phase_steps_mean,
+        "phase_steps_std": phase_steps_std,
     }
 
 
@@ -1177,6 +1419,7 @@ def run_pose_variant1_eval_shared(
     pose_delay_steps: int,
     pose_noise_std: float,
     pose_drift_noise_std: float,
+    success_metric: str,
 ) -> list[tuple[EvalSummary, list]]:
     """Run pose-corruption Variant 1 evaluation for each mode (phase-based)."""
     from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.phase_detector import PickPlacePhaseDetector
@@ -1224,6 +1467,7 @@ def run_pose_variant1_eval_shared(
                     num_envs=env.unwrapped.num_envs,
                     device=device,
                 )
+
                 env.unwrapped.pose_corruption_manager = pose_manager
 
                 metrics = run_evaluation_episodes_pose_v1(
@@ -1239,7 +1483,10 @@ def run_pose_variant1_eval_shared(
                     **metrics,
                 )
                 results.append(result)
-                phase_results.append(metrics["success_rate"])
+                if success_metric == "all":
+                    phase_results.append(metrics.get("success_rate_all", metrics["success_rate"]))
+                else:
+                    phase_results.append(metrics["success_rate"])
                 # Pose corrupted is timestep-level rate (matches duration sweep intuition); also show episode trigger rate.
                 print(
                     f"Success: {metrics['success_rate']:.1%}, "
@@ -1279,6 +1526,7 @@ def run_pose_variant2_eval_shared(
     pose_delay_steps: int,
     pose_noise_std: float,
     pose_drift_noise_std: float,
+    success_metric: str,
 ) -> list[tuple[EvalSummary, list]]:
     """Run pose-corruption Variant 2 evaluation for each mode (time-based)."""
     from Manipulation_policy.tasks.manager_based.manipulation.stack.mdp.pose_corruption_cfg import PoseCorruptionCfg
@@ -1334,7 +1582,10 @@ def run_pose_variant2_eval_shared(
                     **metrics,
                 )
                 results.append(result)
-                onset_results.append(metrics["success_rate"])
+                if success_metric == "all":
+                    onset_results.append(metrics.get("success_rate_all", metrics["success_rate"]))
+                else:
+                    onset_results.append(metrics["success_rate"])
                 print(
                     f"Success: {metrics['success_rate']:.1%}, "
                     f"Pose corrupted (steps): {metrics['corruption_step_rate']:.1%}, "
@@ -1594,6 +1845,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"Modes: {modes}")
         print(f"Episodes per condition: {args_cli.pose_eval_episodes}")
         print(f"Output: {args_cli.pose_eval_output_dir}")
+        print(f"Success metric: {args_cli.pose_eval_success_metric}")
         print("=" * 70)
 
         device = agent_cfg.device
@@ -1662,6 +1914,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Run Variant 1
         if args_cli.pose_eval_variant in ["1", "both"]:
+            # Configure triggered-only collection behavior for the eval loops.
+            # Stored on the unwrapped env so the eval functions can access without signature churn.
+            setattr(env.unwrapped, "__pose_eval_require_triggered", bool(args_cli.pose_eval_require_triggered))
+            setattr(env.unwrapped, "__pose_eval_max_attempts_multiplier", int(args_cli.pose_eval_max_attempts_multiplier))
             outputs = run_pose_variant1_eval_shared(
                 env=env,
                 policy=policy,
@@ -1677,6 +1933,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 pose_delay_steps=args_cli.pose_eval_delay_steps,
                 pose_noise_std=args_cli.pose_eval_noise_std,
                 pose_drift_noise_std=args_cli.pose_eval_drift_noise_std,
+                success_metric=args_cli.pose_eval_success_metric,
             )
             for summary, results in outputs:
                 save_eval_results(args_cli.pose_eval_output_dir, summary, results)
@@ -1684,6 +1941,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Run Variant 2
         if args_cli.pose_eval_variant in ["2", "both"]:
+            setattr(env.unwrapped, "__pose_eval_require_triggered", bool(args_cli.pose_eval_require_triggered))
+            setattr(env.unwrapped, "__pose_eval_max_attempts_multiplier", int(args_cli.pose_eval_max_attempts_multiplier))
             outputs = run_pose_variant2_eval_shared(
                 env=env,
                 policy=policy,
@@ -1699,6 +1958,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 pose_delay_steps=args_cli.pose_eval_delay_steps,
                 pose_noise_std=args_cli.pose_eval_noise_std,
                 pose_drift_noise_std=args_cli.pose_eval_drift_noise_std,
+                success_metric=args_cli.pose_eval_success_metric,
             )
             for summary, results in outputs:
                 save_eval_results(args_cli.pose_eval_output_dir, summary, results)
